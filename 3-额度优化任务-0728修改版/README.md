@@ -18,7 +18,7 @@
 | `optimal_credit_limit_precomputed_grid_large.py` | 读取概率网格，运行 `c2` 敏感性分析或正式优化，输出组合评价报告。 |
 | `analyze_oof_credit_limit.py` | 生成折外概率分箱、ALE、概率曲线和组合约束诊断。 |
 | `viz_credit_limit.py` | 生成额度、概率、等级、风险和目标函数图表。 |
-| `修改记录_0716到0723.md` | 记录从 0716 基线代码到 0723 当前代码的全部调整。 |
+
 
 ## 运行流程
 
@@ -170,7 +170,7 @@ reports/parameter_selection/c2_selection/c2_sensitivity_summary.csv
 
 ### 人才等级额度上下限
 
-当前政策只定义 F3、F2、F1、E、D 五档，数字映射为：
+定义 F3、F2、F1、E、D 五档，数字映射为：
 
 | 数字等级 | 档位 |
 | ---: | --- |
