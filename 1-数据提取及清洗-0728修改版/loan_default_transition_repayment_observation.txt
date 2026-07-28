@@ -1,0 +1,152 @@
+proc sql;
+connect to greenplm as mppconn(
+    dsn=warehouse310
+    authdomain=gppaaauth
+);
+
+/*
+   首次由正常/非违约转为违约后的还款观察。
+   违约：RT_ACCT_STAT_2 IN ('3','4','7','9')；其余状态均视为非违约。
+   注：贷款到期日使用 RT_CURR_MATUR_DATE_1；RT_ACCT_EFF_DATE_1 为贷款生效日。
+*/
+create table loan_default_transition_repayment as
+select * from connection to mppconn(
+WITH
+params AS (
+    SELECT DATE'2026-07-27' AS observation_date
+),
+
+/* ① 与原脚本一致的消贷账户筛选，仅保留本次所需的账户标识和日期字段。 */
+loan_all AS (
+    SELECT DISTINCT
+        L.P6_CUST_NUM                                        AS CST_ID,
+        '31001' || L.RT_CTL3 || L.RT_CTL4 || L.RT_ACCT_NUM AS LOANACCTNO,
+        L.RT_ACCT_EFF_DATE_1                                 AS ACCT_EFF_DT,
+        L.RT_CURR_MATUR_DATE_1                               AS MATUR_DT
+    FROM Ngb310view.T209_LS_AMWKPL08_H L
+    CROSS JOIN params p
+    WHERE SUBSTR(L.AMWKPL08_FILLER, 1, 4) IN (
+              '0063','0163','0045','0046','0064',
+              '0065','0246','0217','0218','0219','0220'
+          )
+      AND L.RT_ACCT_EFF_DATE_1 IS NOT NULL
+      AND L.RT_CURR_MATUR_DATE_1 IS NOT NULL
+      AND L.RT_ACCT_EFF_DATE_1 >= DATE'2025-01-01'
+      AND L.RT_ACCT_EFF_DATE_1 <= p.observation_date
+),
+
+/* ② 仅扫描入选账户在贷款生效日至观察日之间的状态历史。 */
+loan_history AS (
+    SELECT
+        a.CST_ID,
+        a.LOANACCTNO,
+        a.ACCT_EFF_DT,
+        a.MATUR_DT,
+        L.STDT,
+        L.EDDT,
+        L.RT_ACCT_STAT_2,
+        /* 正常本金 */
+        L.BAL_NORMAL_PRIN,
+        /* 逾期本金 */
+        L.BAL_OF_PAST_DUE_PRN,
+        /* 非应计本金 */
+        L.BAL_DQ_PRIN,
+        /* 呆账本金 */
+        L.BAL_OF_BAD_PRIN,
+        /* 累计还本（含逾期金额） */
+        L.TOT_PAY_AMT_2,
+        /* 总还款额（本金） */
+        L.TOT_PRI_PAYMENT_AMT,
+        /* 累计还本额 */
+        L.BA_AMT_PD_ITD,
+        CASE WHEN L.RT_ACCT_STAT_2 IN ('3', '4', '7', '9') THEN 1 ELSE 0 END
+            AS DEFAULT_FLAG
+    FROM Ngb310view.T209_LS_AMWKPL08_H L
+    INNER JOIN loan_all a
+        ON '31001' || L.RT_CTL3 || L.RT_CTL4 || L.RT_ACCT_NUM = a.LOANACCTNO
+    CROSS JOIN params p
+    WHERE L.STDT <= p.observation_date
+      AND L.EDDT > a.ACCT_EFF_DT
+),
+
+/* ③ 标记每笔贷款的状态变化；首条历史记录不视为“由非违约变违约”。 */
+status_sequence AS (
+    SELECT
+        h.*,
+        LAG(h.DEFAULT_FLAG) OVER (
+            PARTITION BY h.LOANACCTNO
+            ORDER BY h.STDT, h.EDDT
+        ) AS PREVIOUS_DEFAULT_FLAG
+    FROM loan_history h
+),
+
+/* ④ 每笔贷款仅保留首次由非违约转为违约的快照，作为观察起点。 */
+first_default_transition AS (
+    SELECT
+        s.*,
+        ROW_NUMBER() OVER (
+            PARTITION BY s.LOANACCTNO
+            ORDER BY s.STDT, s.EDDT
+        ) AS TRANSITION_RN
+    FROM status_sequence s
+    WHERE s.DEFAULT_FLAG = 1
+      AND s.PREVIOUS_DEFAULT_FLAG = 0
+),
+
+/* ⑤ 观察终点 = min(观察起点后12个月、贷款到期日、观察日)。 */
+observation_window AS (
+    SELECT
+        f.*,
+        LEAST(
+            (f.STDT + INTERVAL '12 month')::date,
+            f.MATUR_DT,
+            p.observation_date
+        ) AS OBS_END_DT
+    FROM first_default_transition f
+    CROSS JOIN params p
+    WHERE f.TRANSITION_RN = 1
+),
+
+/* ⑥ 从已筛选的账户状态历史中定位观察终点快照。
+   不再二次扫描 T209_LS_AMWKPL08_H，终点仅输出所需的三项还款字段。 */
+end_repayment_snapshot AS (
+    SELECT
+        w.LOANACCTNO,
+        h.TOT_PAY_AMT_2,
+        h.TOT_PRI_PAYMENT_AMT,
+        h.BA_AMT_PD_ITD
+    FROM observation_window w
+    INNER JOIN loan_history h
+        ON h.LOANACCTNO = w.LOANACCTNO
+       AND h.STDT <= w.OBS_END_DT
+       AND h.EDDT  >  w.OBS_END_DT
+)
+
+SELECT
+    w.CST_ID,
+    w.LOANACCTNO,
+    w.ACCT_EFF_DT,
+    w.MATUR_DT,
+    w.STDT AS OBS_START_DT,
+    w.OBS_END_DT,
+    w.RT_ACCT_STAT_2 AS RT_ACCT_STAT_2_OBS_START,
+    /* 观察起点字段 */
+    w.BAL_NORMAL_PRIN AS BAL_NORMAL_PRIN_OBS_START,
+    w.BAL_OF_PAST_DUE_PRN AS BAL_OF_PAST_DUE_PRN_OBS_START,
+    w.BAL_DQ_PRIN AS BAL_DQ_PRIN_OBS_START,
+    w.BAL_OF_BAD_PRIN AS BAL_OF_BAD_PRIN_OBS_START,
+    w.TOT_PAY_AMT_2 AS TOT_PAY_AMT_2_OBS_START,
+    w.TOT_PRI_PAYMENT_AMT AS TOT_PRI_PAYMENT_AMT_OBS_START,
+    w.BA_AMT_PD_ITD AS BA_AMT_PD_ITD_OBS_START,
+    /* 观察终点字段 */
+    e.TOT_PAY_AMT_2 AS TOT_PAY_AMT_2_OBS_END,
+    e.TOT_PRI_PAYMENT_AMT AS TOT_PRI_PAYMENT_AMT_OBS_END,
+    e.BA_AMT_PD_ITD AS BA_AMT_PD_ITD_OBS_END
+FROM observation_window w
+LEFT JOIN end_repayment_snapshot e
+    ON w.LOANACCTNO = e.LOANACCTNO
+WHERE w.OBS_END_DT >= w.STDT
+);
+
+disconnect from mppconn;
+quit;

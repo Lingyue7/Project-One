@@ -1,0 +1,74 @@
+proc sql;
+connect to greenplm as mppconn(
+    dsn=warehouse310
+    authdomain=gppaaauth
+);
+
+/*
+   科创客户消贷账户：违约风险因变量终点快照。
+   仅输出匹配主键、风险快照日和该日有效的 RT_ACCT_STAT_2。
+*/
+create table kechuang_risk_snapshot_final as
+select * from connection to mppconn(
+WITH
+/* ① 科创客户，仅保留构造主键所需字段。 */
+kechuang_base AS (
+    SELECT DISTINCT
+        k."客户编号" AS CST_ID
+    FROM Ngb310view.sh_yyw_qlmd_tojk006 k
+),
+
+/* ② 与基础提取文件完全一致的消贷账户筛选。 */
+loan_all AS (
+    SELECT DISTINCT
+        L.P6_CUST_NUM                                        AS CST_ID,
+        '31001' || L.RT_CTL3 || L.RT_CTL4 || L.RT_ACCT_NUM AS LOANACCTNO,
+        L.RT_CURR_MATUR_DATE_1                               AS MATUR_DT
+    FROM Ngb310view.T209_LS_AMWKPL08_H L
+    WHERE SUBSTR(L.AMWKPL08_FILLER, 1, 4) IN (
+              '0063','0163','0045','0046','0064',
+              '0065','0246','0217','0218','0219','0220'
+          )
+      AND L.RT_ACCT_EFF_DATE_1 IS NOT NULL
+      AND L.RT_CURR_MATUR_DATE_1 IS NOT NULL
+      AND L.RT_ACCT_EFF_DATE_1 >= DATE'2025-01-01'
+      AND L.RT_ACCT_EFF_DATE_1 <= DATE'2026-07-27'
+),
+
+/* ③ 保留基础提取文件相同的 CST_ID + LOANACCTNO 匹配逻辑；
+   风险快照日 = min(贷款到期日、观察日) - 1 天。 */
+intersection_base AS (
+    SELECT
+        kb.CST_ID,
+        la.LOANACCTNO,
+        (LEAST(la.MATUR_DT, DATE'2026-07-27') - INTERVAL '1 day')::date
+            AS RISK_SNAP_DT
+    FROM kechuang_base kb
+    INNER JOIN loan_all la
+        ON kb.CST_ID = la.CST_ID
+),
+
+/* ④ 仅提取风险快照日有效的账户状态。 */
+loan_snap_risk_mid AS (
+    SELECT
+        ib.CST_ID,
+        ib.LOANACCTNO,
+        ib.RISK_SNAP_DT,
+        L.RT_ACCT_STAT_2 AS RT_ACCT_STAT_2_END
+    FROM intersection_base ib
+    INNER JOIN Ngb310view.T209_LS_AMWKPL08_H L
+        ON '31001' || L.RT_CTL3 || L.RT_CTL4 || L.RT_ACCT_NUM = ib.LOANACCTNO
+       AND L.STDT <= ib.RISK_SNAP_DT
+       AND L.EDDT  >  ib.RISK_SNAP_DT
+)
+
+SELECT
+    CST_ID,
+    LOANACCTNO,
+    RISK_SNAP_DT,
+    RT_ACCT_STAT_2_END
+FROM loan_snap_risk_mid
+);
+
+disconnect from mppconn;
+quit;
