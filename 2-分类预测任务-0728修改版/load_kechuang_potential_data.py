@@ -890,6 +890,7 @@ def clean_data_potential(
         "acct_eff_dt",          # 兼容旧SQL：贷款开始日期
         "matur_dt",             # 兼容旧SQL：贷款到期日期
         "end_snap_dt",          # 贷款终点快照日（到期日前一天）
+        "risk_snap_dt",         # 违约风险终点快照日，仅用于取数对齐，不进入清洗后数据或模型
         "x_snap_dt",            # X 特征快照时点
         # ── 旧结构 ID 字段（兼容保留） ──
         "cst_id0",
