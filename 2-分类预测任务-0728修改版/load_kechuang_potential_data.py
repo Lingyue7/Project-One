@@ -20,12 +20,9 @@
   ac_curr_bal_diff、ac_accr_bal_diff、ba_out_bal_diff（构造因变量后删除）
   rt_acct_stat_2、time_of_dq、dq_hist_day_ctr、dq_num_pmts_pdue、
   du_pmt_rem_1、rt_actl_pmts_rem、bal_of_int_rev、rt_acct_eff_date_1、
-  ac_curr_bal、ac_accr_bal、ba_out_bal（贷款起点原始字段，除 rt_loan_rate /
-  tot_num_payment_1 / zm_memo2_amt2_4 外均删除）
+  ac_curr_bal、ac_accr_bal、ba_out_bal、rt_loan_rate、tot_num_payment_1、
+  zm_memo2_amt2_4（贷款起点/表现辅助字段均不进入最终模型）
   rt_acct_stat_2_end（y_dq_risk 构造后删除；y_freq 模式在 Part1 删除）
-
-保留的贷款起点字段（有建模意义）：
-  rt_loan_rate、tot_num_payment_1、zm_memo2_amt2_4
 
 主要流程：
   1.   read_data                        —— 读取 CSV 或 Excel
@@ -55,6 +52,27 @@ from sklearn.preprocessing import LabelEncoder
 def _mode_or_nan(x: pd.Series):
     m = x.mode()
     return m.iloc[0] if len(m) > 0 else np.nan
+
+
+def _sum_min_count_one(x: pd.Series):
+    """求和但保留“整组均缺失”为 NaN，避免把未知结果伪装成 0。"""
+    return pd.to_numeric(x, errors="coerce").sum(min_count=1)
+
+
+def _canonicalize_category_code(value):
+    """规范化数值类别代码，同时保留合法的文本类别。"""
+    if pd.isna(value):
+        return np.nan
+    text = str(value).strip()
+    if text.lower() in {"", "nan", "none", "<na>"}:
+        return np.nan
+    try:
+        numeric = float(text)
+    except (ValueError, TypeError):
+        return text
+    if not np.isfinite(numeric):
+        return np.nan
+    return str(int(numeric)) if numeric.is_integer() else text
 
 
 def get_consumption_field_cn_map() -> Dict[str, str]:
@@ -164,12 +182,14 @@ def _worst_status(x: pd.Series):
     此处先转 float 再转 int 再转 str，确保 "3.0" → "3"。
     """
     def _to_str(v):
+        if pd.isna(v):
+            return np.nan
         try:
             return str(int(float(v)))
         except (ValueError, TypeError):
             return str(v).strip()
 
-    vals = x.map(_to_str)
+    vals = x.map(_to_str).dropna()
     for bad in ["9", "7", "4", "3"]:
         if bad in vals.values:
             return bad
@@ -224,7 +244,7 @@ def report_cst_loan_duplicates(df: pd.DataFrame) -> pd.DataFrame:
     )
 
     if loan_col is None or "cst_id" not in df.columns:
-        print("  ⚠️  未找到 cst_id 或 loanacctno 字段，跳过重复检查")
+        print("  [警告] 未找到 cst_id 或 loanacctno 字段，跳过重复检查")
         return df
 
     key_cols = ["cst_id", loan_col]
@@ -234,7 +254,7 @@ def report_cst_loan_duplicates(df: pd.DataFrame) -> pd.DataFrame:
         dup_detail.groupby(key_cols, dropna=False).size()
         .reset_index(name="重复行数").sort_values("重复行数", ascending=False)
     )
-    print(f"\n  ── (cst_id, {loan_col}) 重复检查（不去重）──")
+    print(f"\n  -- (cst_id, {loan_col}) 重复检查（不去重）--")
     print("重复组合数：", len(dup_summary))
     print("重复涉及行数：", int(dup_mask.sum()))
     if dup_summary.empty:
@@ -260,6 +280,39 @@ def report_cst_loan_duplicates(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def deduplicate_exact_cst_loan(df: pd.DataFrame) -> pd.DataFrame:
+    """仅删除字段完全一致的重复账户；冲突重复必须先制定业务合并规则。"""
+    loan_col = next(
+        (c for c in ["loanacctno", "loan_acct_no", "loanacct_no"] if c in df.columns),
+        None,
+    )
+    if "cst_id" not in df.columns or loan_col is None:
+        raise KeyError("账户去重需要 cst_id 和 loanacctno。")
+    for key in ("cst_id", loan_col):
+        normalized = df[key].astype("string").str.strip()
+        invalid = normalized.isna() | normalized.eq("")
+        if invalid.any():
+            raise ValueError(
+                f"账户去重键 {key} 存在 {int(invalid.sum()):,} 个空值，"
+                "不能安全执行去重。"
+            )
+
+    key_cols = ["cst_id", loan_col]
+    duplicate_rows = df[df.duplicated(key_cols, keep=False)]
+    if not duplicate_rows.empty:
+        value_cols = [c for c in df.columns if c not in key_cols]
+        conflicting = (
+            duplicate_rows.groupby(key_cols, dropna=False)[value_cols]
+            .nunique(dropna=False).gt(1).any(axis=1)
+        )
+        if conflicting.any():
+            raise ValueError(
+                f"发现 {int(conflicting.sum()):,} 组同一客户-贷款账号存在字段冲突；"
+                "不能用 keep='first' 任意去重，请先制定业务合并规则。"
+            )
+    return df.drop_duplicates(subset=key_cols, keep="first").copy()
+
+
 # ─────────────────────────────────────────────
 # Step 0.08：类别型字段强制转换（聚合前，必须在 filter_dq_start_customers 之前）
 # ─────────────────────────────────────────────
@@ -281,27 +334,22 @@ def cast_cat_cols(df: pd.DataFrame) -> pd.DataFrame:
     cat_int_cols = [
         "mar_sttn_cd",
         "cst_star_cd",
-        "age",
         "occup_cd",
         "gnd_cd",
         "rt_acct_stat_2_end",
         "rt_acct_stat_2",
     ]
 
-    def _float_to_intstr(v):
-        try:
-            return str(int(float(v)))
-        except (ValueError, TypeError):
-            return np.nan
-
     converted = []
     for col in cat_int_cols:
         if col in df.columns:
-            df[col] = df[col].map(_float_to_intstr)
+            df[col] = df[col].map(_canonicalize_category_code)
             converted.append(col)
 
     if converted:
         print(f"  已将类别型字段转为整数字符串（共 {len(converted)} 个）: {converted}")
+    if "age" in df.columns:
+        df["age"] = pd.to_numeric(df["age"], errors="coerce")
     return df
 
 
@@ -347,7 +395,7 @@ def rename_kechuang_cols(df: pd.DataFrame) -> pd.DataFrame:
         df = df.rename(columns=actual_rename)
         print(f"  科创字段已恢复中文列名: {list(actual_rename.values())}")
     else:
-        print("  ⚠️  未找到英文科创字段，跳过重命名（可能已是中文列名）")
+        print("  [警告] 未找到英文科创字段，跳过重命名（可能已是中文列名）")
     return df
 
 
@@ -445,7 +493,7 @@ def get_feature_descriptive_stats(
     """返回数值型字段统计，以及类别型字段众数和各类别比例。"""
     known_categorical = {
         "gnd_cd", "mar_sttn_cd", "education_cd", "occup_cd",
-        "cst_star_cd", "age", "档位",
+        "cst_star_cd", "档位",
     }
     cols = [c for c in feature_cols if c in df.columns]
     categorical_cols = [
@@ -457,7 +505,9 @@ def get_feature_descriptive_stats(
 
     numeric_rows = []
     for field in numeric_cols:
-        values = pd.to_numeric(df[field], errors="coerce")
+        values = pd.to_numeric(df[field], errors="coerce").replace(
+            [np.inf, -np.inf], np.nan
+        )
         numeric_rows.append({
             "字段": field,
             "最小值": values.min(),
@@ -467,7 +517,10 @@ def get_feature_descriptive_stats(
 
     category_rows = []
     for field in categorical_cols:
-        values = df[field].astype("string").fillna("<缺失>")
+        values = df[field].astype("string").str.strip()
+        values = values.mask(
+            values.isna() | values.str.lower().isin({"", "nan", "none", "<na>"})
+        ).fillna("<缺失>")
         counts = values.value_counts(dropna=False)
         mode_value = counts.index[0] if len(counts) else np.nan
         total = len(values)
@@ -520,7 +573,7 @@ def filter_by_maturity(
     def _fmt(v):
         return f"{v:,}" if isinstance(v, (int, float)) else "N/A（列不存在）"
 
-    print(f"\n  ── 到期日筛选前 ──")
+    print(f"\n  -- 到期日筛选前 --")
     print(f"     账户行数  : {n_rows_before:,}")
     print(f"     客户数    : {_fmt(n_cust_before)}")
     print(f"     贷款账号数: {_fmt(n_loan_before)}")
@@ -530,22 +583,25 @@ def filter_by_maturity(
         return df
 
     if "rt_curr_matur_date_1" not in df.columns:
-        print(f"  ⚠️  未找到字段 rt_curr_matur_date_1，跳过到期日筛选")
-        return df
+        raise KeyError("已启用到期日筛选，但数据缺少 rt_curr_matur_date_1。")
 
     # 转换到期日字段：兼容 "31MAY2026"（SAS 格式）和标准日期格式
-    df["rt_curr_matur_date_1"] = pd.to_datetime(
-        df["rt_curr_matur_date_1"], format="%d%b%Y", errors="coerce"
-    )
-    mask_failed = df["rt_curr_matur_date_1"].isna()
+    raw_maturity = df["rt_curr_matur_date_1"].copy()
+    parsed_maturity = pd.to_datetime(raw_maturity, format="%d%b%Y", errors="coerce")
+    mask_failed = parsed_maturity.isna()
     if mask_failed.any():
-        df.loc[mask_failed, "rt_curr_matur_date_1"] = pd.to_datetime(
-            df_raw.copy().rename(columns=str.lower)["rt_curr_matur_date_1"][mask_failed],
-            errors="coerce"
+        parsed_maturity.loc[mask_failed] = pd.to_datetime(
+            raw_maturity.loc[mask_failed], errors="coerce"
         )
+    invalid_dates = int(parsed_maturity.isna().sum())
+    if invalid_dates:
+        print(f"  [警告] 到期日缺失/无法解析 {invalid_dates:,} 行，这些行不会通过到期日筛选。")
+    df["rt_curr_matur_date_1"] = parsed_maturity
 
     cutoff_dt = pd.Timestamp(maturity_cutoff)
     df = df[df["rt_curr_matur_date_1"] <= cutoff_dt].copy()
+    if df.empty:
+        raise ValueError("到期日筛选后没有剩余样本，请核对日期格式与 maturity_cutoff。")
 
     n_rows_after = len(df)
     n_cust_after = df["cst_id"].nunique() if "cst_id" in df.columns else None
@@ -554,7 +610,7 @@ def filter_by_maturity(
     def _diff(a, b):
         return f"{a - b:,}" if isinstance(a, int) and isinstance(b, int) else "N/A"
 
-    print(f"\n  ── 到期日筛选后（rt_curr_matur_date_1 <= {maturity_cutoff}）──")
+    print(f"\n  -- 到期日筛选后（rt_curr_matur_date_1 <= {maturity_cutoff}）--")
     print(f"     账户行数  : {n_rows_after:,}  （减少 {n_rows_before - n_rows_after:,} 行）")
     print(f"     客户数    : {_fmt(n_cust_after)}  （减少 {_diff(n_cust_before, n_cust_after)} 位）")
     print(f"     贷款账号数: {_fmt(n_loan_after)}  （减少 {_diff(n_loan_before, n_loan_after)} 个）")
@@ -592,8 +648,7 @@ def filter_by_eff_date(
     df = df.copy()
 
     if "rt_acct_eff_date_1" not in df.columns:
-        print("  ⚠️  未找到字段 rt_acct_eff_date_1，跳过生效日筛选")
-        return df
+        raise KeyError("已启用生效日筛选，但数据缺少 rt_acct_eff_date_1。")
 
     n_rows_before = len(df)
     n_cust_before = df["cst_id"].nunique() if "cst_id" in df.columns else None
@@ -603,7 +658,7 @@ def filter_by_eff_date(
     def _fmt(v):
         return f"{v:,}" if isinstance(v, (int, float)) else "N/A"
 
-    print(f"\n  ── 贷款生效日筛选前 ──")
+    print(f"\n  -- 贷款生效日筛选前 --")
     print(f"     账户行数  : {n_rows_before:,}")
     print(f"     客户数    : {_fmt(n_cust_before)}")
     print(f"     贷款账号数: {_fmt(n_loan_before)}")
@@ -614,20 +669,27 @@ def filter_by_eff_date(
     mask_failed = eff_parsed.isna()
     if mask_failed.any():
         eff_parsed[mask_failed] = pd.to_datetime(eff_col[mask_failed], errors="coerce")
+    invalid_dates = int(eff_parsed.isna().sum())
+    if invalid_dates:
+        print(f"  [警告] 生效日缺失/无法解析 {invalid_dates:,} 行，这些行不会通过生效日筛选。")
     df["rt_acct_eff_date_1"] = eff_parsed
 
     lower_dt = pd.Timestamp(eff_date_lower)
     upper_dt = pd.Timestamp(eff_date_upper)
+    if lower_dt > upper_dt:
+        raise ValueError("eff_date_lower 不能晚于 eff_date_upper。")
     df = df[
         (df["rt_acct_eff_date_1"] >= lower_dt) &
         (df["rt_acct_eff_date_1"] <= upper_dt)
     ].copy()
+    if df.empty:
+        raise ValueError("生效日筛选后没有剩余样本，请核对日期格式和筛选区间。")
 
     n_rows_after = len(df)
     n_cust_after = df["cst_id"].nunique() if "cst_id" in df.columns else None
     n_loan_after = df[_loan_col].nunique() if _loan_col else None
 
-    print(f"\n  ── 贷款生效日筛选后（{eff_date_lower} ~ {eff_date_upper}）──")
+    print(f"\n  -- 贷款生效日筛选后（{eff_date_lower} ~ {eff_date_upper}）--")
     print(f"     账户行数  : {n_rows_after:,}  （减少 {n_rows_before - n_rows_after:,} 行）")
     print(f"     客户数    : {_fmt(n_cust_after)}")
     print(f"     贷款账号数: {_fmt(n_loan_after)}")
@@ -659,8 +721,9 @@ def filter_dq_start_customers(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
     if "rt_acct_stat_2" not in df.columns:
-        print("  ⚠️  未找到字段 rt_acct_stat_2，跳过起点违约客户剔除")
-        return df
+        raise KeyError("y_dq_risk 模式需要 rt_acct_stat_2 以剔除起点已违约客户。")
+    if "cst_id" not in df.columns:
+        raise KeyError("起点违约客户剔除缺少 cst_id。")
 
     DQ_STATUS = {"3", "4", "7", "9"}
     stat_str = df["rt_acct_stat_2"].astype(str).str.strip()
@@ -672,9 +735,9 @@ def filter_dq_start_customers(df: pd.DataFrame) -> pd.DataFrame:
     n_cust_after = df["cst_id"].nunique()
     n_rows_after = len(df)
 
-    print(f"\n  ── 起点违约客户剔除（y_dq_risk 模式）──")
+    print(f"\n  -- 起点违约客户剔除（y_dq_risk 模式）--")
     print(f"     剔除前客户数 : {n_cust_before:,}  行数: {n_rows_before:,}")
-    print(f"     起点违约客户 : {len(bad_cst_ids):,} 位（rt_acct_stat_2 ∈ {{3,4,7,9}}）")
+    print(f"     起点违约客户 : {len(bad_cst_ids):,} 位（rt_acct_stat_2 in {{3,4,7,9}}）")
     print(f"     剔除后客户数 : {n_cust_after:,}  行数: {n_rows_after:,}")
     return df
 
@@ -682,6 +745,37 @@ def filter_dq_start_customers(df: pd.DataFrame) -> pd.DataFrame:
 # ─────────────────────────────────────────────
 # Step 1：一客多贷聚合
 # ─────────────────────────────────────────────
+
+def get_customer_static_conflicts(
+    df: pd.DataFrame, columns: List[str]
+) -> pd.DataFrame:
+    """统计同一客户静态字段出现多个值的情况，供聚合前质量审计。"""
+    result_columns = ["字段", "冲突客户数", "单客最大不同值数"]
+    if "cst_id" not in df.columns:
+        raise KeyError("客户静态字段冲突检查缺少 cst_id。")
+    available = [col for col in columns if col in df.columns]
+    multi_customer_rows = df[df.duplicated("cst_id", keep=False)]
+    if not available or multi_customer_rows.empty:
+        return pd.DataFrame(columns=result_columns)
+    distinct_counts = (
+        multi_customer_rows.groupby("cst_id", dropna=False)[available]
+        .nunique(dropna=False)
+    )
+    rows = []
+    for col in available:
+        conflict = distinct_counts[col] > 1
+        if conflict.any():
+            rows.append({
+                "字段": col,
+                "冲突客户数": int(conflict.sum()),
+                "单客最大不同值数": int(distinct_counts.loc[conflict, col].max()),
+            })
+    if not rows:
+        return pd.DataFrame(columns=result_columns)
+    return pd.DataFrame(rows).sort_values(
+        ["冲突客户数", "字段"], ascending=[False, True]
+    ).reset_index(drop=True)
+
 
 def aggregate_by_customer_potential(df_raw: pd.DataFrame) -> pd.DataFrame:
     """
@@ -694,6 +788,15 @@ def aggregate_by_customer_potential(df_raw: pd.DataFrame) -> pd.DataFrame:
       - credamt：排除状态码 5/8 的行后求和
       - 科创人才字段（中文列名）：first 聚合
     """
+    if "cst_id" not in df_raw.columns:
+        raise KeyError("一客多贷聚合缺少 cst_id。")
+    customer_ids = df_raw["cst_id"].astype("string").str.strip()
+    invalid_id = customer_ids.isna() | customer_ids.eq("")
+    if invalid_id.any():
+        raise ValueError(
+            f"发现 {int(invalid_id.sum()):,} 行 cst_id 为空；"
+            "不能静默丢弃或把多个未知客户聚合到一起。"
+        )
     df = df_raw.copy()
 
     # ── 开户日期副本（供概率校准的时间切分使用，不参与建模） ──
@@ -767,11 +870,22 @@ def aggregate_by_customer_potential(df_raw: pd.DataFrame) -> pd.DataFrame:
         "acgmocrr6mampbftxdnum", "acgmoclrr6mampbftxamt",
     ]
 
+    static_audit_cols = (
+        cust_cols_mode + cust_cols_first + kechuang_first_cols + mpb_first_cols
+    )
+    static_conflicts = get_customer_static_conflicts(df, static_audit_cols)
+    if not static_conflicts.empty:
+        print(
+            "  [警告] 同一客户的静态字段存在多值；"
+            "mode/first 聚合可能遮蔽上游冲突，请核对："
+        )
+        print(static_conflicts.to_string(index=False))
+
     agg_dict: Dict[str, object] = {}
 
     for c in bal_diff_sum_cols:
         if c in df.columns:
-            agg_dict[c] = "sum"
+            agg_dict[c] = _sum_min_count_one
 
     for c, func in loan_special_agg.items():
         if c in df.columns:
@@ -779,7 +893,7 @@ def aggregate_by_customer_potential(df_raw: pd.DataFrame) -> pd.DataFrame:
 
     for c in credit_sum_cols:
         if c in df.columns:
-            agg_dict[c] = "sum"
+            agg_dict[c] = _sum_min_count_one
 
     for c in credit_first_cols + loan_keep_first_cols:
         if c in df.columns:
@@ -853,20 +967,18 @@ def clean_data_potential(
     # ── 数值型读入但实为类别型的字段：去掉 .0 后转字符串 ──
     # 这些字段从 Excel/CSV 读入后为 float（如 3.0），需还原为整数字符串（"3"）
     cat_int_cols = [
-        "mar_sttn_cd", "cst_star_cd", "age",
-        "occup_cd", "gnd_cd", "rt_acct_stat_2_end",
-        "rt_acct_stat_2",
+        "mar_sttn_cd", "cst_star_cd", "occup_cd", "gnd_cd",
+        "rt_acct_stat_2_end", "rt_acct_stat_2",
     ]
     for col in cat_int_cols:
         if col in df.columns:
-            def _float_to_intstr(v):
-                try:
-                    return str(int(float(v)))
-                except (ValueError, TypeError):
-                    return np.nan
-            df[col] = df[col].map(_float_to_intstr)
+            df[col] = df[col].map(_canonicalize_category_code)
     print(f"  已将类别型字段转为整数字符串: "
           f"{[c for c in cat_int_cols if c in df.columns]}")
+
+    # 年龄是真实连续变量，不能随代码字段一起转成 LabelEncoder 类别。
+    if "age" in df.columns:
+        df["age"] = pd.to_numeric(df["age"], errors="coerce")
 
     # ── 日期列转 datetime ──
     date_cols = [
@@ -881,6 +993,13 @@ def clean_data_potential(
     snap = pd.Timestamp(snapshot_date)
     if "bank_cust_become_date" in df.columns:
         df["days_since_become_cust"] = (snap - df["bank_cust_become_date"]).dt.days
+        future_count = int((df["days_since_become_cust"] < 0).sum())
+        if future_count:
+            print(
+                f"  [警告] bank_cust_become_date 晚于快照日的客户 "
+                f"{future_count:,} 人，days_since_become_cust 已设为缺失。"
+            )
+            df.loc[df["days_since_become_cust"] < 0, "days_since_become_cust"] = np.nan
         print("  已生成 days_since_become_cust")
 
     # ── 删除所有不进入建模的字段 ──
@@ -1014,16 +1133,13 @@ def build_labels_potential(
     work = df.copy()
     n_total = len(work)
     if threshold_fit_mask is None:
-        threshold_source = work
-        threshold_scope = "all rows"
+        fit_mask = np.ones(len(work), dtype=bool)
     else:
         fit_mask = np.asarray(threshold_fit_mask, dtype=bool)
         if len(fit_mask) != len(work):
             raise ValueError("threshold_fit_mask length must equal len(df)")
         if not fit_mask.any():
             raise ValueError("threshold_fit_mask selects zero rows")
-        threshold_source = work.loc[fit_mask]
-        threshold_scope = "train only (%d rows)" % len(threshold_source)
 
     thresholds: Dict[str, float] = {
         "target":      target,
@@ -1043,18 +1159,32 @@ def build_labels_potential(
         DQ_STATUS = {"3", "4", "7", "9"}
         # 与 _worst_status 保持一致：float→int→str，防止 "3.0" 匹配不上 "3"
         def _to_clean_str_label(v):
+            if pd.isna(v):
+                return np.nan
             try:
                 return str(int(float(v)))
             except (ValueError, TypeError):
                 return str(v).strip()
         stat_str = work["rt_acct_stat_2_end"].map(_to_clean_str_label)
+        valid_status = stat_str.notna() & stat_str.str.fullmatch(r"\d+")
+        n_missing_status = int((~valid_status).sum())
+        if n_missing_status:
+            print(
+                f"  [警告] rt_acct_stat_2_end 缺失/无效 {n_missing_status:,} 人，"
+                "标签无法定义，已从建模样本排除。"
+            )
+            work = work.loc[valid_status].copy()
+            stat_str = stat_str.loc[valid_status]
+        if work.empty:
+            raise ValueError("rt_acct_stat_2_end 没有任何有效值，无法构造 y_dq_risk。")
+        n_total = len(work)
         work["y_dq_risk"] = stat_str.isin(DQ_STATUS).astype(int)
         n_pos = int(work["y_dq_risk"].sum())
-        print(f"\n  {'─'*55}")
+        print(f"\n  {'-'*55}")
         print(f"  y_dq_risk 构造统计")
-        print(f"  {'─'*55}")
-        print(f"  rt_acct_stat_2_end ∈ {{3,4,7,9}} → 1 : {n_pos:>6,} 人  ({n_pos/n_total:.2%})")
-        print(f"  {'─'*55}")
+        print(f"  {'-'*55}")
+        print(f"  rt_acct_stat_2_end in {{3,4,7,9}} -> 1 : {n_pos:>6,} 人  ({n_pos/n_total:.2%})")
+        print(f"  {'-'*55}")
         return work, thresholds
 
     # ════════════════════════════════════════
@@ -1069,14 +1199,47 @@ def build_labels_potential(
     if y_freq_mode not in VALID_MODES:
         raise ValueError(f"y_freq_mode 仅支持 {VALID_MODES}，当前传入: '{y_freq_mode}'")
 
+    required_by_mode = {
+        "bout_gt0_and_curr_p80": ["ba_out_bal_diff", "ac_curr_bal_diff"],
+        "bout_p80_and_accr_p80": ["ba_out_bal_diff", "ac_accr_bal_diff"],
+        "curr_p80_only": ["ac_curr_bal_diff"],
+        "curr_p80_and_bout_p80": ["ac_curr_bal_diff", "ba_out_bal_diff"],
+    }
+    label_source_cols = required_by_mode[y_freq_mode]
+    missing = [c for c in label_source_cols if c not in work.columns]
+    if missing:
+        raise ValueError(f"模式 '{y_freq_mode}' 缺少字段: {missing}")
+    label_values = work[label_source_cols].apply(pd.to_numeric, errors="coerce")
+    valid_label = np.isfinite(label_values.to_numpy(dtype=float)).all(axis=1)
+    n_invalid_label = int((~valid_label).sum())
+    if n_invalid_label:
+        print(
+            f"  [警告] 标签来源字段 {label_source_cols} 存在缺失的客户 "
+            f"{n_invalid_label:,} 人，已从建模样本排除。"
+        )
+        work = work.loc[valid_label].copy()
+        label_values = label_values.loc[valid_label]
+        fit_mask = fit_mask[valid_label]
+    if work.empty:
+        raise ValueError("标签来源字段没有完整样本，无法构造 y_freq。")
+    if not fit_mask.any():
+        raise ValueError("排除标签缺失客户后，threshold_fit_mask 不再包含任何样本。")
+    work.loc[:, label_source_cols] = label_values
+    threshold_source = work.loc[fit_mask]
+    threshold_scope = (
+        "all valid rows" if threshold_fit_mask is None
+        else "train only (%d valid rows)" % len(threshold_source)
+    )
+    n_total = len(work)
+
     thr_bout = float("nan")
     thr_curr = float("nan")
     thr_accr = float("nan")
 
-    print(f"\n  {'─'*55}")
+    print(f"\n  {'-'*55}")
     print(f"  y_freq 构造统计（模式: {y_freq_mode}）")
     print(f"  P80 阈值拟合范围: {threshold_scope}")
-    print(f"  {'─'*55}")
+    print(f"  {'-'*55}")
 
     if y_freq_mode == "bout_gt0_and_curr_p80":
         required = ["ba_out_bal_diff", "ac_curr_bal_diff"]
@@ -1136,7 +1299,7 @@ def build_labels_potential(
     n_freq = int(work["y_freq"].sum())
     print(f"  y_freq=1（两者交集）                                 : "
           f"{n_freq:>6,} 人  ({n_freq/n_total:.2%})")
-    print(f"  {'─'*55}")
+    print(f"  {'-'*55}")
 
     thresholds.update({"thr_bout": thr_bout, "thr_curr": thr_curr, "thr_accr": thr_accr})
     return work, thresholds
@@ -1164,7 +1327,19 @@ def get_feature_stats(
     }
 
     feature_cols = [c for c in df.columns if c not in exclude_cols]
-    miss_rates = df[feature_cols].isnull().mean()
+    missing_masks = {}
+    for col in feature_cols:
+        values = df[col]
+        if pd.api.types.is_numeric_dtype(values):
+            numeric = pd.to_numeric(values, errors="coerce")
+            missing_masks[col] = numeric.isna() | ~np.isfinite(numeric)
+        else:
+            text_values = values.astype("string").str.strip()
+            missing_masks[col] = (
+                text_values.isna()
+                | text_values.str.lower().isin({"", "nan", "none", "<na>"})
+            )
+    miss_rates = pd.DataFrame(missing_masks, index=df.index).mean()
     feature_missing_df = (
         pd.DataFrame({"feature": miss_rates.index, "missing_rate": miss_rates.values})
         .sort_values("missing_rate", ascending=False)
@@ -1202,6 +1377,169 @@ def get_feature_stats(
 # Step 5：特征工程（删列/填充、LabelEncoder）
 # ─────────────────────────────────────────────
 
+class PotentialFeaturePreprocessor:
+    """只在训练数据上拟合缺失处理与类别编码，再复用于其他数据集。"""
+
+    _DROP_COLS = {
+        "cst_id", "cst_id0", "blng_insid", "cst_blng_insid",
+        "y_freq", "y_dq_risk", "rt_acct_stat_2_end", "split_eff_date",
+    }
+    _TIER_ORDER = {
+        "F3": 1, "F3级": 1, "f3": 1,
+        "F2": 2, "F2级": 2, "f2": 2,
+        "F1": 3, "F1级": 3, "f1": 3,
+        "E": 4, "E级": 4, "e": 4,
+        "D": 5, "D级": 5, "d": 5,
+        "C": 6, "C级": 6, "c": 6,
+        "B": 7, "B级": 7, "b": 7,
+        "A": 8, "A级": 8, "a": 8,
+    }
+    # 这些字段即使从 CSV/Excel 读成整数，也是无序代码而非连续数值。
+    _KNOWN_CATEGORICAL = {
+        "gnd_cd", "mar_sttn_cd", "education_cd", "occup_cd",
+        "cst_star_cd", "busikind",
+    }
+
+    def __init__(
+        self,
+        target: str = "y_freq",
+        add_quota_sq: bool = True,
+        add_quota_cube: bool = True,
+        add_quota_log: bool = False,
+        missing_threshold: float = 0.4,
+    ):
+        if target not in ("y_freq", "y_dq_risk"):
+            raise ValueError("target 仅支持 'y_freq' 或 'y_dq_risk'")
+        if not 0 < missing_threshold <= 1:
+            raise ValueError("missing_threshold 必须在 (0, 1] 内。")
+        self.target = target
+        self.add_quota_sq = add_quota_sq
+        self.add_quota_cube = add_quota_cube
+        self.add_quota_log = add_quota_log
+        self.missing_threshold = float(missing_threshold)
+
+    def _prepare_features(self, work: pd.DataFrame) -> pd.DataFrame:
+        X = work.drop(
+            columns=[c for c in self._DROP_COLS if c in work.columns]
+        ).copy()
+        dt_cols = list(X.select_dtypes(include=["datetime", "datetimetz"]).columns)
+        if dt_cols:
+            X = X.drop(columns=dt_cols)
+
+        if "credamt" in X.columns:
+            cred = pd.to_numeric(X["credamt"], errors="coerce")
+            cred_norm = cred / 1_000_000
+            if self.add_quota_sq:
+                X["credamt_sq"] = cred_norm ** 2
+            if self.add_quota_cube:
+                X["credamt_cube"] = cred_norm ** 3
+            if self.add_quota_log:
+                X["credamt_log"] = np.log(np.maximum(cred.fillna(0), 1.0))
+
+        if "档位" in X.columns:
+            raw_tier = X["档位"].astype("string").str.strip()
+            X["档位"] = raw_tier.map(self._TIER_ORDER).fillna(0).astype(int)
+        return X
+
+    @staticmethod
+    def _clean_category(values: pd.Series) -> pd.Series:
+        cleaned = values.astype("string").str.strip()
+        return cleaned.mask(
+            cleaned.isna() | cleaned.str.lower().isin({"", "nan", "none", "<na>"})
+        )
+
+    def fit(self, work: pd.DataFrame):
+        X = self._prepare_features(work)
+        categorical_dtypes = ["object", "string", "category", "bool"]
+        dtype_categorical = set(
+            X.select_dtypes(include=categorical_dtypes).columns
+        )
+        categorical_cols = [
+            col for col in X.columns
+            if col in dtype_categorical or col in self._KNOWN_CATEGORICAL
+        ]
+        numeric_cols = [
+            col for col in X.select_dtypes(include=[np.number]).columns
+            if col not in categorical_cols
+        ]
+        for col in numeric_cols:
+            X[col] = pd.to_numeric(X[col], errors="coerce").replace(
+                [np.inf, -np.inf], np.nan
+            )
+        missing_rates = {
+            col: float(X[col].isna().mean()) for col in numeric_cols
+        }
+        missing_rates.update({
+            col: float(self._clean_category(X[col]).isna().mean())
+            for col in categorical_cols
+        })
+        self.dropped_high_missing_ = [
+            col for col in X.columns
+            if col in missing_rates and missing_rates[col] >= self.missing_threshold
+        ]
+        numeric_cols = [c for c in numeric_cols if c not in self.dropped_high_missing_]
+        categorical_cols = [
+            c for c in categorical_cols if c not in self.dropped_high_missing_
+        ]
+        self.numeric_fill_values_ = {
+            col: float(pd.to_numeric(X[col], errors="coerce").median())
+            for col in numeric_cols
+        }
+
+        self.categorical_features_ = categorical_cols
+        self.categorical_fill_values_ = {}
+        self.label_encoders_: Dict[str, LabelEncoder] = {}
+        for col in self.categorical_features_:
+            cleaned = self._clean_category(X[col])
+            non_missing = cleaned.dropna().astype(str)
+            mode = non_missing.mode()
+            fill_value = str(mode.iloc[0]) if len(mode) else "未知"
+            values = cleaned.fillna(fill_value).astype(str)
+            encoder = LabelEncoder().fit(values)
+            self.categorical_fill_values_[col] = fill_value
+            self.label_encoders_[col] = encoder
+
+        valid_features = set(numeric_cols) | set(self.categorical_features_)
+        self.numeric_features_ = numeric_cols
+        self.feature_names_ = [c for c in X.columns if c in valid_features]
+        if not self.feature_names_:
+            raise ValueError("预处理后没有可用于建模的数值或类别特征。")
+        self.is_fitted_ = True
+        return self
+
+    def transform(self, work: pd.DataFrame) -> pd.DataFrame:
+        if not getattr(self, "is_fitted_", False):
+            raise RuntimeError("请先在训练数据上调用 fit。")
+        X = self._prepare_features(work)
+        transformed = pd.DataFrame(index=work.index)
+
+        for col in self.numeric_features_:
+            values = (
+                pd.to_numeric(X[col], errors="coerce")
+                if col in X.columns else pd.Series(np.nan, index=work.index)
+            )
+            values = values.replace([np.inf, -np.inf], np.nan)
+            transformed[col] = values.fillna(self.numeric_fill_values_[col]).astype(float)
+
+        for col in self.categorical_features_:
+            if col in X.columns:
+                values = self._clean_category(X[col])
+            else:
+                values = pd.Series(pd.NA, index=work.index, dtype="string")
+            values = values.fillna(self.categorical_fill_values_[col]).astype(str)
+            mapping = {
+                value: code
+                for code, value in enumerate(self.label_encoders_[col].classes_)
+            }
+            # 验证/测试中新类别不能反向改变训练词表；-1 交给 LightGBM 按缺失类别处理。
+            transformed[col] = values.map(mapping).fillna(-1).astype(int)
+
+        return transformed[self.feature_names_]
+
+    def fit_transform(self, work: pd.DataFrame) -> pd.DataFrame:
+        return self.fit(work).transform(work)
+
+
 def feature_engineering_potential(
     work: pd.DataFrame,
     target: str = "y_freq",
@@ -1209,122 +1547,29 @@ def feature_engineering_potential(
     add_quota_cube: bool = True,
     add_quota_log: bool = False,
 ) -> Tuple[pd.DataFrame, pd.Series, List[str], Dict[str, LabelEncoder]]:
-    """
-    特征工程：
-      1. 提取 y，去掉 cst_id / 标签列 / 兜底泄露列
-      2. 删除任何残留 datetime 列
-      3. 授信额度多项式特征（可选）
-      4. 档位有序编码（F3=1 最低 → A=8 最高）
-      5. 数值型缺失处理：
-           缺失率 <40%  → 中位数填充
-           缺失率 >=40% → 删列，并输出被删列名
-      6. 类别型缺失填充：众数，无众数则 "未知"
-      7. LabelEncoder（直接 fit_transform）
-      8. 只保留数值型列，返回纯数值特征矩阵 X
-    """
-    if target not in ("y_freq", "y_dq_risk"):
-        raise ValueError("target 仅支持 'y_freq' 或 'y_dq_risk'")
-
+    """兼容旧接口；正式建模应在切分后单独 fit ``PotentialFeaturePreprocessor``。"""
+    if target not in work.columns:
+        raise KeyError(f"数据中不存在目标列: {target}")
     y = work[target].astype(int)
-
-    # ── 去掉所有不进入建模的列（兜底） ──
-    # split_eff_date 是开户日期副本（供概率校准时间切分），绝不能进入模型：
-    # 从 CSV 读回时它会变成字符串（非 datetime），无法被下方 datetime 过滤捕获，
-    # 因此必须在此显式删除，防止泄露。
-    drop_cols = (
-        {"cst_id", "cst_id0", "blng_insid", "cst_blng_insid"} |
-        {"y_freq", "y_dq_risk", "rt_acct_stat_2_end"} |
-        {"split_eff_date"}
+    preprocessor = PotentialFeaturePreprocessor(
+        target=target,
+        add_quota_sq=add_quota_sq,
+        add_quota_cube=add_quota_cube,
+        add_quota_log=add_quota_log,
     )
-    X = work.drop(columns=[c for c in drop_cols if c in work.columns]).copy()
-
-    # ── 删除剩余 datetime 列 ──
-    dt_cols = list(X.select_dtypes(include=["datetime64[ns]", "datetime64[ns, UTC]"]).columns)
-    if dt_cols:
-        X = X.drop(columns=dt_cols)
-        print(f"  已删除剩余日期列: {dt_cols}")
-
-    # ── 授信额度多项式特征 ──
-    if "credamt" in X.columns:
-        cred = X["credamt"].astype(float)
-        cred_norm = cred / 1_000_000
-        if add_quota_sq:
-            X["credamt_sq"] = cred_norm ** 2
-        if add_quota_cube:
-            X["credamt_cube"] = cred_norm ** 3
-        if add_quota_log:
-            X["credamt_log"] = np.log(np.maximum(cred.fillna(0), 1.0))
-
-    # ── 档位有序编码（F3=1 最低 → A=8 最高） ──
-    if "档位" in X.columns:
-        tier_order = {
-            "F3": 1, "F3级": 1, "f3": 1,
-            "F2": 2, "F2级": 2, "f2": 2,
-            "F1": 3, "F1级": 3, "f1": 3,
-            "E":  4, "E级":  4, "e":  4,
-            "D":  5, "D级":  5, "d":  5,
-            "C":  6, "C级":  6, "c":  6,
-            "B":  7, "B级":  7, "b":  7,
-            "A":  8, "A级":  8, "a":  8,
-        }
-        raw_vals = X["档位"].astype(str).str.strip()
-        mapped = raw_vals.map(tier_order)
-        n_unmapped = mapped.isna().sum()
-        if n_unmapped > 0:
-            unmapped_vals = raw_vals[mapped.isna()].unique().tolist()
-            print(f"  ⚠️  档位字段有 {n_unmapped} 个值未能映射: {unmapped_vals}，填充为 0")
-        X["档位"] = mapped.fillna(0).astype(int)
-
-    # ── 数值型缺失处理：>=40% 删列，<40% 中位数填充 ──
-    numeric_cols = list(X.select_dtypes(include=[np.number]).columns)
-    cols_to_drop_high_miss = []
-    n_filled_num = 0
-    for col in numeric_cols:
-        if X[col].isnull().sum() > 0:
-            miss_ratio = X[col].isnull().mean()
-            if miss_ratio >= 0.4:
-                cols_to_drop_high_miss.append(col)
-            else:
-                X[col] = X[col].fillna(X[col].median())
-                n_filled_num += 1
-
-    if cols_to_drop_high_miss:
-        X = X.drop(columns=cols_to_drop_high_miss)
-        print(f"\n  ⚠️  因缺失率 >=40% 被删除的列（共 {len(cols_to_drop_high_miss)} 个）：")
-        for c in cols_to_drop_high_miss:
-            print(f"       {c}")
-
-    if n_filled_num > 0:
-        print(f"  数值型缺失填充：{n_filled_num} 个字段（缺失率<40%，用中位数填充）")
-
-    # ── 类别型缺失填充 ──
-    categorical_cols = [c for c in X.select_dtypes(include=["object"]).columns if c != "档位"]
-    n_filled_cat = 0
-    for col in categorical_cols:
-        if X[col].isnull().sum() > 0:
-            mode_val = X[col].mode()
-            fill_val = mode_val.iloc[0] if len(mode_val) > 0 else "未知"
-            X[col] = X[col].fillna(fill_val)
-            n_filled_cat += 1
-    if n_filled_cat > 0:
-        print(f"  类别型缺失填充：{n_filled_cat} 个字段（众数，无众数填'未知'）")
-
-    # ── LabelEncoder ──
-    cat_features = [c for c in X.select_dtypes(include=["object"]).columns if c != "档位"]
-    label_encoders: Dict[str, LabelEncoder] = {}
-    for col in cat_features:
-        le = LabelEncoder()
-        X[col] = le.fit_transform(X[col].astype(str))
-        label_encoders[col] = le
-    if cat_features:
-        print(f"  LabelEncoder：{len(cat_features)} 个类别特征已编码")
-
-    # ── 只保留数值型 ──
-    X = X.select_dtypes(include=[np.number]).copy()
-    feature_names = X.columns.tolist()
-
-    print(f"  特征工程完成：{len(feature_names)} 个特征，{len(y)} 个样本")
-    return X, y, feature_names, label_encoders
+    X = preprocessor.fit_transform(work)
+    if preprocessor.dropped_high_missing_:
+        print(
+            f"  [警告] 因缺失率 >=40% 被删除的列（训练数据口径，"
+            f"共 {len(preprocessor.dropped_high_missing_)} 个）："
+        )
+        for col in preprocessor.dropped_high_missing_:
+            print(f"       {col}")
+    print(
+        f"  特征工程完成：{len(preprocessor.feature_names_)} 个特征，{len(y)} 个样本；"
+        f"类别特征 {len(preprocessor.categorical_features_)} 个"
+    )
+    return X, y, preprocessor.feature_names_, preprocessor.label_encoders_
 
 
 # ─────────────────────────────────────────────
@@ -1365,16 +1610,16 @@ def load_kechuang_potential(
     add_quota_cube         : 是否添加授信额度三次方项
     add_quota_log          : 是否添加 log(授信额度) 项
     apply_maturity_filter  : 是否执行到期日筛选（True=筛选，False=跳过）
-    maturity_cutoff        : 到期日阈值（含），格式 "YYYY-MM-DD"，默认 "2026-05-31"
+    maturity_cutoff        : 到期日阈值（含），格式 "YYYY-MM-DD"，默认 "2026-07-21"
     y_freq_mode            : 仅 target='y_freq' 时有效，可选：
                                "bout_gt0_and_curr_p80"  → ba_out_bal_diff>0 且 ac_curr_bal_diff>=P80（默认）
                                "bout_p80_and_accr_p80"  → ba_out_bal_diff>=P80 且 ac_accr_bal_diff>=P80
                                "curr_p80_only"          → ac_curr_bal_diff>=P80（单条件）
                                "curr_p80_and_bout_p80"  → ac_curr_bal_diff>=P80 且 ba_out_bal_diff>=P80
-    apply_eff_date_filter  : 是否执行生效日筛选（True=筛选，False=跳过），默认 True
+    apply_eff_date_filter  : 是否执行生效日筛选（True=筛选，False=跳过），默认 False
     eff_date_lower         : 生效日下限（含），默认 "2024-10-01"（对应消费偏好表最早快照）
     eff_date_upper         : 生效日上限（含），默认 "2026-03-31"（对应消费偏好表最晚快照）
-    dedup_cst_loan         : True 时按 (cst_id, loanacctno) 保留第一条；False 时仅输出重复统计
+    dedup_cst_loan         : True 时仅删除字段完全一致的重复账户；冲突重复会报错
 
     返回
     ----
@@ -1411,9 +1656,9 @@ def load_kechuang_potential(
         null_cnt = int(df["rt_acct_stat_2_end"].isna().sum())
         total_rows = len(df)
         total_cst  = df["cst_id"].nunique() if "cst_id" in df.columns else -1
-        print(f"  ┌─ [违约追踪] {label}")
-        print(f"  │  总行数={total_rows:,}  总客户={total_cst:,}")
-        print(f"  │  终点违约行(∈3/4/7/9)={dq_rows:,}  对应客户数={dq_cst:,}")
+        print(f"  +-- [违约追踪] {label}")
+        print(f"  |  总行数={total_rows:,}  总客户={total_cst:,}")
+        print(f"  |  终点违约行(in 3/4/7/9)={dq_rows:,}  对应客户数={dq_cst:,}")
         # 各状态码明细（仅针对违约行）
         loan_col = next((c for c in ["loanacctno", "loan_acct_no"] if c in df.columns), None)
         for code in ["3", "4", "7", "9"]:
@@ -1423,8 +1668,8 @@ def load_kechuang_potential(
             n_loan_c = int(df.loc[mask_c, loan_col].nunique()) if loan_col else -1
             if n_rows_c > 0:
                 pct_of_dq = n_rows_c / dq_rows * 100 if dq_rows > 0 else 0
-                print(f"  │    状态{code}: 行数={n_rows_c:,}({pct_of_dq:.1f}%)  客户数={n_cst_c:,}  贷款账户数={n_loan_c:,}")
-        print(f"  └─ 终点状态为空={null_cnt:,}")
+                print(f"  |    状态{code}: 行数={n_rows_c:,}({pct_of_dq:.1f}%)  客户数={n_cst_c:,}  贷款账户数={n_loan_c:,}")
+        print(f"  +-- 终点状态为空={null_cnt:,}")
 
     def _count_dq_agg(df, label):
         """聚合后数据（一客一行）：统计 rt_acct_stat_2_end 为违约状态的客户数"""
@@ -1434,10 +1679,10 @@ def load_kechuang_potential(
         dq_cst   = int(s.isin(DQ_SET).sum())
         null_cnt = int(df["rt_acct_stat_2_end"].isna().sum())
         total    = len(df)
-        print(f"  ┌─ [违约追踪] {label}")
-        print(f"  │  总客户={total:,}")
-        print(f"  │  终点违约客户(∈3/4/7/9)={dq_cst:,}  ({dq_cst/total:.2%})")
-        print(f"  └─ 终点状态为空={null_cnt:,}")
+        print(f"  +-- [违约追踪] {label}")
+        print(f"  |  总客户={total:,}")
+        print(f"  |  终点违约客户(in 3/4/7/9)={dq_cst:,}  ({dq_cst/total:.2%})")
+        print(f"  +-- 终点状态为空={null_cnt:,}")
     # ─────────────────────────────────────────
 
     print(f"[1/7] 读取文件: {file_path}")
@@ -1454,17 +1699,15 @@ def load_kechuang_potential(
     print(f"[2.5/8] (cst_id, loanacctno) 重复检查（dedup={dedup_cst_loan}）...")
     df0 = report_cst_loan_duplicates(df0)
     if dedup_cst_loan:
-        loan_col = next((c for c in ["loanacctno", "loan_acct_no"] if c in df0.columns), None)
-        if loan_col is None or "cst_id" not in df0.columns:
-            print("  ⚠️  未找到 cst_id 或 loanacctno 字段，无法执行去重")
-        else:
-            n_before = len(df0)
-            df0 = df0.drop_duplicates(subset=["cst_id", loan_col], keep="first").copy()
-            print(f"  已按 (cst_id, {loan_col}) 去重：{n_before:,} → {len(df0):,} 行，"
-                  f"删除 {n_before - len(df0):,} 行")
+        n_before = len(df0)
+        df0 = deduplicate_exact_cst_loan(df0)
+        print(
+            f"  已删除字段完全一致的重复账户：{n_before:,} → {len(df0):,} 行，"
+            f"删除 {n_before - len(df0):,} 行"
+        )
     _count_dq_rows(df0, "重复检查后（行级）")
 
-    print(f"[2.8/8] 类别型字段浮点→整数字符串转换（必须在起点违约剔除之前）...")
+    print(f"[2.8/8] 类别型字段浮点->整数字符串转换（必须在起点违约剔除之前）...")
     df0 = cast_cat_cols(df0)
     _count_dq_rows(df0, "类型转换后（行级）")
 
@@ -1503,18 +1746,18 @@ def load_kechuang_potential(
     if target == "y_dq_risk" and "y_dq_risk" in df3.columns:
         n_pos = int(df3["y_dq_risk"].sum())
         total  = len(df3)
-        print(f"  ┌─ [违约追踪] 标签构造后")
-        print(f"  │  总客户={total:,}  y_dq_risk=1={n_pos:,}  ({n_pos/total:.2%})")
-        print(f"  └─ y_dq_risk=0={total - n_pos:,}")
+        print(f"  +-- [违约追踪] 标签构造后")
+        print(f"  |  总客户={total:,}  y_dq_risk=1={n_pos:,}  ({n_pos/total:.2%})")
+        print(f"  +-- y_dq_risk=0={total - n_pos:,}")
 
     print("[6.5/8] 数据清洗 Part2（因变量构造后：删泄露/diff/起点无意义字段）...")
     df_clean = drop_post_label_cols(df3, target=target)
     if target == "y_dq_risk" and "y_dq_risk" in df_clean.columns:
         n_pos = int(df_clean["y_dq_risk"].sum())
         total  = len(df_clean)
-        print(f"  ┌─ [违约追踪] 清洗Part2后（最终建模样本）")
-        print(f"  │  总客户={total:,}  y_dq_risk=1={n_pos:,}  ({n_pos/total:.2%})")
-        print(f"  └─ y_dq_risk=0={total - n_pos:,}")
+        print(f"  +-- [违约追踪] 清洗Part2后（最终建模样本）")
+        print(f"  |  总客户={total:,}  y_dq_risk=1={n_pos:,}  ({n_pos/total:.2%})")
+        print(f"  +-- y_dq_risk=0={total - n_pos:,}")
 
     print("[7/8] 特征统计 + 特征工程...")
     feature_missing_df, label_stats_df = get_feature_stats(df_clean, target=target)
@@ -1527,8 +1770,8 @@ def load_kechuang_potential(
     )
 
     # ── 最终汇报 ──
-    print(f"\n{'━'*55}")
-    print(f"✅  预处理完成")
+    print(f"\n{'='*55}")
+    print(f"[完成] 预处理完成")
     print(f"   客户数          : {len(df_clean):,}")
     print(f"   特征数          : {len(feature_names):,}")
     print(f"   建模目标        : {target}")
@@ -1537,7 +1780,7 @@ def load_kechuang_potential(
     print(f"   正样本率        : {y.mean():.4%}  ({y.sum()} / {len(y)})")
     if target == "y_dq_risk":
         print(f"   最终 y_dq_risk=1: {int(y.sum()):,} 人")
-    print(f"{'━'*55}")
+    print(f"{'='*55}")
 
     return (
         df_clean, feature_missing_df, label_stats_df, X, y, feature_names,
