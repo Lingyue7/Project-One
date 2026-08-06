@@ -4,14 +4,24 @@
 
 推荐从 `credit_limit_optimization.ipynb` 开始运行。Notebook 串联数据清洗、四段时间划分、概率模型与校准、优化参数计算、`c2` 候选比较、最终测试集离线评价、全量历史客户交叉拟合优化、诊断和可视化。
 
+## 前置步骤：先完整运行任务2两次
+
+任务3同时依赖 `y_freq` 支用模型和 `y_dq_risk` 违约模型。运行本目录 Notebook 前，必须先在任务2中使用相同数据和参数分别完整运行：
+
+1. `TARGET = "y_freq"`，生成 `sampling_method_selection_y_freq.csv`；
+2. `TARGET = "y_dq_risk"`，生成 `sampling_method_selection_y_dq_risk.csv`；
+3. 将两个结果文件中 `selected=True` 行的 `method_key` 分别填入本任务的 `SAMPLING_METHOD_USAGE`、`SAMPLING_METHOD_DEFAULT`，并同步各自的 `SAMPLING_STRATEGY`、`SAMPLING_N_ESTIMATORS` 和 `SAMPLING_ENSEMBLE_RATIO`。若选中 `baseline`，对应方法填写 `None`。
+
+只完成其中一个目标时，不应继续生成任务3概率网格。
+
 ## 文件说明
 
 | 文件 | 主要职责 |
 | --- | --- |
 | `credit_limit_optimization.ipynb` | 主流程 Notebook；集中配置数据、模型、参数计算、候选实测、优化和报告。 |
 | `parameter_selection.py` | 计算平均支用率与 `c1`、历史回收法 LGD、人才等级额度上限，并保存参数审计结果。 |
-| `load_kechuang_potential_data.py` | 将账户级数据聚合为客户级样本，构造双标签并处理泄露字段。 |
-| `sampling_methods.py` | 类别不平衡采样工具；采样只允许作用于模型训练数据。 |
+| `load_kechuang_potential_data.py` | 与任务2同步的数据口径：安全重复检查、账户到客户聚合、双标签构造、缺失标签排除和训练集拟合特征处理。 |
+| `sampling_methods.py` | 与任务2同步的类别不平衡采样工具；距离型方法在训练数据内拟合 RobustScaler，混合特征按 SMOTENC 规则处理。 |
 | `generate_probability_grid.py` | 执行时间划分、训练支用/违约模型并生成开发阶段和全量折外校准概率网格。 |
 | `probability_calibration.py` | Isotonic 校准、Brier Score、ECE 和校准曲线评估工具。 |
 | `portfolio_milp_optimizer.py` | 构造并求解离散 0-1 组合整数规划。 |
@@ -228,11 +238,25 @@ R = 1.05 × Σ[历史额度_i × 校准违约概率_i(历史额度_i)]
 
 ```python
 DATA_FILE = "实际原始数据文件.csv"
-SAMPLING_METHOD = None        # 填写任务2已经选定的方法；无采样则保留 None
+SAMPLING_METHOD_USAGE = None          # 任务2 TARGET='y_freq' 最终方法
+SAMPLING_STRATEGY_USAGE = 1.0
+SAMPLING_N_ESTIMATORS_USAGE = 10
+SAMPLING_ENSEMBLE_RATIO_USAGE = 1.0
+
+SAMPLING_METHOD_DEFAULT = None        # 任务2 TARGET='y_dq_risk' 最终方法
+SAMPLING_STRATEGY_DEFAULT = 1.0
+SAMPLING_N_ESTIMATORS_DEFAULT = 10
+SAMPLING_ENSEMBLE_RATIO_DEFAULT = 1.0
 LGD_HISTORY_FILE = None       # 有可靠回收明细时填写路径
 LGD_SELECTED_SCENARIO = "neutral"
 INTEREST_RATE = 0.03
 ```
+
+数据加载与采样实现均已与任务2同步。两边使用相同原始文件、日期窗口、起点违约剔除规则和统一双标签客户池；`y_freq` 来源或 `y_dq_risk` 终点状态任一不完整，客户都会从两个任务的建模样本中排除。默认 `DEDUP_CST_LOAN=False`，只报告同一客户-贷款账号的重复与字段冲突；设为 `True` 时仅删除字段完全一致的重复账户，冲突重复会直接报错，避免任意保留第一行。
+
+连续特征仅在当前建模训练折内拟合 `RobustScaler`，名义类别字段使用加权 one-hot 距离和类别众数合成，`age` 保持连续变量，`档位`保持有序数值。`Balance Cascade` 由每轮实际训练的 LightGBM 驱动多数类淘汰，`Easy Ensemble` 和级联模型的概率均按成员平均后再进入校准和额度网格。
+
+两个目标分别使用任务2对应目标选定的采样配置。只要某一目标启用采样，该目标模型就会禁用 `scale_pos_weight`，避免采样与类别权重重复叠加。若任务2最终选中 `balance_cascade` 或 `easy_ensemble`，还必须同步该目标的成员数及子集比例。更改上述任一数据或采样参数后，必须将 `SKIP_CLEANING=False`、`REUSE_PROBABILITY_GRID=False` 重新生成清洗数据、开发阶段及交叉拟合概率网格。
 
 如果填写 `LGD_HISTORY_FILE`，还必须把 `LGD_COLUMN_MAP` 改成文件中的真实列名。
 

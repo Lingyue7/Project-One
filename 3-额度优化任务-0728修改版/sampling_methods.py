@@ -1,749 +1,520 @@
+"""仅依赖 NumPy/Pandas/scikit-learn 的类别不平衡采样方法。
+
+实现原则：
+1. 距离型方法只在传入的训练集上拟合 RobustScaler；
+2. SMOTENC 按连续特征尺度加权 one-hot 距离，合成类别取 k 个近邻的众数；
+3. SMOTE+ENN/Tomek 按标准组合顺序执行；
+4. Balance Cascade 按目标假阳性率逐轮保留难分多数类，并由实际子模型驱动级联。
 """
-sampling_methods.py
-════════════════════════════════════════════════════════════════════════
-纯 NumPy / Pandas 实现的类别不平衡采样方法，无需安装 imbalanced-learn。
 
-包含方法
---------
-过采样
-  1. SMOTE              — 少数类线性插值过采样 (Chawla et al. 2002)
-  2. BorderlineSMOTE    — 仅对边界危险样本插值 (Han et al. 2005)
-  3. ADASYN             — 自适应权重过采样     (He et al. 2008)
+from __future__ import annotations
 
-欠采样
-  4. RandomUnderSampler — 随机丢弃多数类
-  5. TomekLinks         — 删除 Tomek 对中的多数类样本
-  6. ENN                — 编辑最近邻欠采样
-
-组合
-  7. SMOTEENN           — SMOTE + ENN 清洗     (Batista et al. 2004)
-  8. SMOTETomek         — SMOTE + Tomek Links 清洗
-  9. BalanceCascade     — 级联欠采样集成        (Liu et al. 2006 变体)
- 10. EasyEnsemble       — 随机欠采样集成子集    (Liu et al. 2009)
-
-使用示例
---------
-    from sampling_methods import sampler_factory
-
-    # 单次采样，返回 (X_res, y_res)
-    X_res, y_res = sampler_factory(
-        method="smote",
-        sampling_strategy=0.1,
-        random_state=42,
-    ).fit_resample(X_train, y_train)
-
-    # BalanceCascade / EasyEnsemble 返回子集列表
-    subsets = sampler_factory("balance_cascade", n_estimators=10).fit_resample(X, y)
-    # subsets: [(X_sub0, y_sub0), (X_sub1, y_sub1), ...]
-
-参数说明
---------
-sampling_strategy : float
-    采样后 正样本数 / 负样本数 的目标比值。
-    0.1  → 正样本补/删 到负样本的 10%（正样本率约 9%）
-    0.2  → 正样本补/删 到负样本的 20%（正样本率约 17%）
-    "auto" / 1.0 → 补到 1:1（一般不推荐，易过拟合）
-k_neighbors : int
-    SMOTE 类方法的近邻数，默认 5。
-    正样本很少时会自动降低到 min(k, n_pos-1)。
-"""
+from typing import List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
-from typing import Union, List, Tuple, Optional
-
-# ─────────────────────────────────────────────────────────────────────
-# 工具函数
-# ─────────────────────────────────────────────────────────────────────
-
-def _to_numpy(X, y) -> Tuple[np.ndarray, np.ndarray]:
-    """统一转成 numpy array，保留列顺序（DataFrame → ndarray）。"""
-    X_arr = X.values if hasattr(X, "values") else np.asarray(X)
-    y_arr = y.values if hasattr(y, "values") else np.asarray(y)
-    return X_arr.astype(float), y_arr.astype(int)
+from sklearn.base import clone
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.neighbors import NearestNeighbors
+from sklearn.preprocessing import OneHotEncoder, RobustScaler
 
 
-def _wrap_output(X_res: np.ndarray, y_res: np.ndarray,
-                 original_X) -> Tuple:
-    """如果原始输入是 DataFrame，输出也包成 DataFrame。"""
-    if hasattr(original_X, "columns"):
-        return pd.DataFrame(X_res, columns=original_X.columns), pd.Series(y_res)
-    return X_res, y_res
+ArrayLike = Union[np.ndarray, pd.DataFrame]
 
 
-def _knn_indices(X: np.ndarray, query: np.ndarray, k: int) -> np.ndarray:
-    """
-    暴力 KNN（欧氏距离）。
-    返回 query 中每个样本在 X 中最近的 k 个索引（不含自身）。
-    query 可以是 X 的子集，也可以完全一致（查自身时会跳过距离=0的点）。
-
-    参数
-    ----
-    X     : (n, d) 参考集
-    query : (m, d) 查询集
-    k     : 近邻数
-
-    返回
-    ----
-    indices : (m, k) int array
-    """
-    # 分块计算避免大矩阵 OOM；每块 512 行
-    m = query.shape[0]
-    indices = np.empty((m, k), dtype=int)
-    block = 512
-    for start in range(0, m, block):
-        end = min(start + block, m)
-        q = query[start:end]                          # (b, d)
-        # 平方距离: ||q - X||^2 = ||q||^2 - 2*q@X^T + ||X||^2
-        dist2 = (
-            (q ** 2).sum(axis=1, keepdims=True)
-            - 2 * q @ X.T
-            + (X ** 2).sum(axis=1)
-        )                                              # (b, n)
-        # 排除自身（距离精确为 0 的点）
-        dist2[dist2 < 1e-12] = np.inf
-        # 取最近 k 个
-        idx = np.argpartition(dist2, k, axis=1)[:, :k]
-        # 精确排序（argpartition 不保证顺序）
-        for i in range(end - start):
-            idx[i] = idx[i][np.argsort(dist2[i + start - start, idx[i]])]
-        indices[start:end] = idx
-    return indices
+def _frame(X: ArrayLike) -> Tuple[pd.DataFrame, bool]:
+    if isinstance(X, pd.DataFrame):
+        return X.reset_index(drop=True).copy(), True
+    a = np.asarray(X)
+    return pd.DataFrame(a, columns=[f"x{i}" for i in range(a.shape[1])]), False
 
 
-def _resolve_strategy(strategy, n_pos: int, n_neg: int) -> int:
-    """
-    将 sampling_strategy 转换为"目标正样本数"。
-    strategy=0.1 → 目标正样本数 = round(n_neg * 0.1)
-    strategy="auto" 或 1.0 → 补到 1:1
-    """
-    if strategy == "auto":
-        strategy = 1.0
-    ratio = float(strategy)
-    target_pos = int(round(n_neg * ratio))
-    return max(target_pos, n_pos)   # 只增不减（过采样语义）
+def _series(y) -> pd.Series:
+    return pd.Series(np.asarray(y)).reset_index(drop=True)
 
 
-def _resolve_under_strategy(strategy, n_pos: int, n_neg: int) -> int:
-    """
-    将 sampling_strategy 转换为"目标负样本数"（欠采样语义）。
-    strategy=0.1 → 目标负样本数 = round(n_pos / 0.1)
-    """
-    if strategy == "auto":
-        strategy = 1.0
-    ratio = float(strategy)
-    target_neg = int(round(n_pos / ratio))
-    return min(target_neg, n_neg)   # 只减不增
+def _restore(X: pd.DataFrame, y, was_frame: bool):
+    X = X.reset_index(drop=True)
+    ys = _series(y)
+    return (X, ys) if was_frame else (X.to_numpy(), ys.to_numpy())
 
 
-# ─────────────────────────────────────────────────────────────────────
-# 过采样方法
-# ─────────────────────────────────────────────────────────────────────
+def _cat_names(X: pd.DataFrame, categorical_features: Optional[Sequence]) -> List[str]:
+    values = list(categorical_features or [])
+    if not values:
+        return []
+    if all(isinstance(v, (bool, np.bool_)) for v in values):
+        if len(values) != X.shape[1]:
+            raise ValueError("类别特征布尔掩码长度必须等于特征数。")
+        return [c for c, flag in zip(X.columns, values) if flag]
+    if all(isinstance(v, (int, np.integer)) for v in values):
+        indices = [int(v) for v in values]
+        invalid = [v for v in indices if v < 0 or v >= X.shape[1]]
+        if invalid:
+            raise ValueError(f"类别特征索引越界: {invalid}")
+        names = [X.columns[v] for v in indices]
+        if len(names) != len(set(names)):
+            raise ValueError("类别特征不能重复指定。")
+        return names
+    missing = sorted(set(values) - set(X.columns))
+    if missing:
+        raise ValueError(f"类别特征不在 X 中: {missing}")
+    if len(values) != len(set(values)):
+        raise ValueError("类别特征不能重复指定。")
+    return values
 
-class SMOTE:
-    """
-    Synthetic Minority Over-sampling Technique
-    参考：Chawla et al. (2002). SMOTE: Synthetic Minority Over-sampling
-          Technique. Journal of Artificial Intelligence Research, 16, 321-357.
 
-    原理：对每个少数类样本，在其 k 个最近邻（少数类内部）中随机选一个，
-         在两者连线上随机插值生成合成样本。
+class _MetricSpace:
+    """训练集内拟合的稳健缩放 + 加权 one-hot 距离空间。"""
 
-    参数
-    ----
-    sampling_strategy : float 或 "auto"
-        目标 正/负 比值。
-    k_neighbors : int
-        插值近邻数，默认 5。
-    random_state : int 或 None
-    """
-
-    def __init__(self,
-                 sampling_strategy: Union[float, str] = 0.1,
-                 k_neighbors: int = 5,
-                 random_state: Optional[int] = None):
-        self.sampling_strategy = sampling_strategy
-        self.k_neighbors = k_neighbors
-        self.random_state = random_state
-
-    def fit_resample(self, X, y):
-        rng = np.random.RandomState(self.random_state)
-        X_arr, y_arr = _to_numpy(X, y)
-
-        pos_idx = np.where(y_arr == 1)[0]
-        neg_idx = np.where(y_arr == 0)[0]
-        n_pos, n_neg = len(pos_idx), len(neg_idx)
-
-        target_pos = _resolve_strategy(self.sampling_strategy, n_pos, n_neg)
-        n_synthetic = target_pos - n_pos
-        if n_synthetic <= 0:
-            return _wrap_output(X_arr, y_arr, X)
-
-        X_pos = X_arr[pos_idx]
-        k = min(self.k_neighbors, n_pos - 1)
-        if k < 1:
-            # 正样本太少，直接随机复制
-            chosen = rng.choice(n_pos, size=n_synthetic, replace=True)
-            X_syn = X_pos[chosen]
+    def __init__(self, X: pd.DataFrame, categorical_features=None):
+        self.columns = list(X.columns)
+        self.cat = _cat_names(X, categorical_features)
+        self.cont = [c for c in self.columns if c not in self.cat]
+        self.scaler = RobustScaler().fit(X[self.cont]) if self.cont else None
+        if self.cat:
+            try:
+                self.encoder = OneHotEncoder(handle_unknown="ignore", sparse_output=False).fit(X[self.cat])
+            except TypeError:  # scikit-learn < 1.2
+                self.encoder = OneHotEncoder(handle_unknown="ignore", sparse=False).fit(X[self.cat])
         else:
-            nn_idx = _knn_indices(X_pos, X_pos, k)        # (n_pos, k)
-            chosen = rng.randint(0, n_pos, size=n_synthetic)
-            neighbor = nn_idx[chosen, rng.randint(0, k, size=n_synthetic)]
-            lam = rng.uniform(0, 1, size=(n_synthetic, 1))
-            X_syn = X_pos[chosen] + lam * (X_pos[neighbor] - X_pos[chosen])
+            self.encoder = None
 
-        X_res = np.vstack([X_arr, X_syn])
-        y_res = np.concatenate([y_arr, np.ones(n_synthetic, dtype=int)])
-        return _wrap_output(X_res, y_res, X)
+    def transform(self, X: pd.DataFrame, categorical_scale: float = 1.0) -> np.ndarray:
+        parts = []
+        if self.cont:
+            parts.append(self.scaler.transform(X[self.cont]))
+        if self.cat:
+            parts.append(self.encoder.transform(X[self.cat]) * float(categorical_scale))
+        if not parts:
+            raise ValueError("X 至少需要一个特征。")
+        return np.hstack(parts).astype(float)
 
+    def numeric_scaled(self, X: pd.DataFrame) -> np.ndarray:
+        return self.scaler.transform(X[self.cont]) if self.cont else np.empty((len(X), 0))
 
-class BorderlineSMOTE:
-    """
-    Borderline-SMOTE（变体1：仅用少数类近邻插值）
-    参考：Han et al. (2005). Borderline-SMOTE: A New Over-Sampling Method
-          in Imbalanced Data Sets Learning. ICIC 2005, LNCS 3644, 878-887.
+    def categorical_scale(self, X_reference: pd.DataFrame) -> float:
+        """返回 SMOTENC 的 one-hot 非零值，使一次类别不匹配等于连续特征典型标准差。"""
+        if not self.cat:
+            return 1.0
+        if not self.cont:
+            # 纯类别数据不是标准 SMOTENC 的适用范围；保留普通 one-hot 欧氏距离。
+            return 1.0
+        numeric = self.numeric_scaled(X_reference)
+        median_std = float(np.median(np.std(numeric, axis=0, ddof=0)))
+        if not np.isfinite(median_std) or median_std <= np.finfo(float).eps:
+            # 连续特征全为常数时不能把类别距离缩成 0；令一次类别不匹配距离为 1。
+            return 1.0 / np.sqrt(2.0)
+        # 与 SMOTENC 一致：一个类别不匹配会在 one-hot 中产生两个非零差值。
+        return median_std / np.sqrt(2.0)
 
-    原理：
-      1. 对每个少数类样本，在全体训练集中找 m 个最近邻
-      2. 若多数类近邻占比 ∈ [0.5, 1.0) → 危险样本（DANGER），参与过采样
-      3. 占比 = 1.0 → 噪声，跳过；< 0.5 → 安全，跳过
-      4. 仅在危险样本的少数类近邻之间插值
-    """
-
-    def __init__(self,
-                 sampling_strategy: Union[float, str] = 0.1,
-                 k_neighbors: int = 5,
-                 m_neighbors: int = 10,
-                 random_state: Optional[int] = None):
-        self.sampling_strategy = sampling_strategy
-        self.k_neighbors = k_neighbors
-        self.m_neighbors = m_neighbors
-        self.random_state = random_state
-
-    def fit_resample(self, X, y):
-        rng = np.random.RandomState(self.random_state)
-        X_arr, y_arr = _to_numpy(X, y)
-
-        pos_idx = np.where(y_arr == 1)[0]
-        neg_idx = np.where(y_arr == 0)[0]
-        n_pos, n_neg = len(pos_idx), len(neg_idx)
-
-        target_pos = _resolve_strategy(self.sampling_strategy, n_pos, n_neg)
-        n_synthetic = target_pos - n_pos
-        if n_synthetic <= 0:
-            return _wrap_output(X_arr, y_arr, X)
-
-        X_pos = X_arr[pos_idx]
-        m = min(self.m_neighbors, len(X_arr) - 1)
-
-        # 步骤1：在全体数据中找每个正样本的 m 近邻
-        nn_all = _knn_indices(X_arr, X_pos, m)           # (n_pos, m)
-        # 统计多数类近邻占比
-        is_neg_neighbor = (y_arr[nn_all] == 0)           # (n_pos, m) bool
-        danger_ratio = is_neg_neighbor.mean(axis=1)       # (n_pos,)
-
-        # 危险样本：0.5 ≤ ratio < 1.0
-        danger_mask = (danger_ratio >= 0.5) & (danger_ratio < 1.0)
-        danger_local_idx = np.where(danger_mask)[0]       # 在 X_pos 中的索引
-
-        if len(danger_local_idx) == 0:
-            # 没有危险样本，回退到普通 SMOTE
-            return SMOTE(self.sampling_strategy,
-                         self.k_neighbors,
-                         self.random_state).fit_resample(X, y)
-
-        X_danger = X_pos[danger_local_idx]
-        k = min(self.k_neighbors, n_pos - 1)
-
-        # 步骤2：危险样本在少数类内部找 k 近邻
-        nn_pos = _knn_indices(X_pos, X_danger, k)         # (n_danger, k)
-
-        chosen = rng.randint(0, len(danger_local_idx), size=n_synthetic)
-        neighbor = nn_pos[chosen, rng.randint(0, k, size=n_synthetic)]
-        lam = rng.uniform(0, 1, size=(n_synthetic, 1))
-        X_syn = X_danger[chosen] + lam * (X_pos[neighbor] - X_danger[chosen])
-
-        X_res = np.vstack([X_arr, X_syn])
-        y_res = np.concatenate([y_arr, np.ones(n_synthetic, dtype=int)])
-        return _wrap_output(X_res, y_res, X)
+    def make_rows(self, numeric_scaled: np.ndarray, categorical_rows: pd.DataFrame) -> pd.DataFrame:
+        out = pd.DataFrame(index=np.arange(len(numeric_scaled)))
+        if self.cont:
+            out[self.cont] = self.scaler.inverse_transform(numeric_scaled)
+        for c in self.cat:
+            out[c] = categorical_rows[c].to_numpy()
+        return out[self.columns]
 
 
-class ADASYN:
-    """
-    Adaptive Synthetic Sampling
-    参考：He et al. (2008). ADASYN: Adaptive Synthetic Sampling Approach
-          for Imbalanced Learning. IJCNN 2008, 1322-1328.
+def _nearest_neighbors_excluding_self(
+    fitted_rows: np.ndarray,
+    query_rows: np.ndarray,
+    self_indices: np.ndarray,
+    n_neighbors: int,
+) -> np.ndarray:
+    """逐行按真实索引剔除自身，避免重复坐标时误删另一个零距离样本。"""
+    if n_neighbors < 1 or n_neighbors >= len(fitted_rows):
+        raise ValueError("非自身近邻数必须在 [1, 样本数-1] 内。")
+    raw = NearestNeighbors(
+        n_neighbors=min(n_neighbors + 1, len(fitted_rows))
+    ).fit(fitted_rows).kneighbors(query_rows, return_distance=False)
+    result = []
+    for row, self_index in zip(raw, np.asarray(self_indices, dtype=int)):
+        non_self = row[row != self_index][:n_neighbors]
+        if len(non_self) != n_neighbors:
+            raise RuntimeError("未能取得足够的非自身近邻。")
+        result.append(non_self)
+    return np.vstack(result)
 
-    原理：根据每个少数类样本周围多数类的密度（学习难度）自适应分配合成数量，
-         难度越高的样本生成越多合成样本。
-    """
 
-    def __init__(self,
-                 sampling_strategy: Union[float, str] = 0.1,
-                 k_neighbors: int = 5,
-                 random_state: Optional[int] = None):
-        self.sampling_strategy = sampling_strategy
-        self.k_neighbors = k_neighbors
-        self.random_state = random_state
+def _classes(y: pd.Series):
+    counts = y.value_counts()
+    if len(counts) != 2:
+        raise ValueError("当前 float sampling_strategy 仅支持二分类。")
+    if counts.iloc[0] == counts.iloc[1]:
+        # 平衡数据没有天然多数/少数类，但两个返回标签仍必须不同。
+        return counts.index[1], counts.index[0], int(counts.iloc[1]), int(counts.iloc[0])
+    return counts.idxmin(), counts.idxmax(), int(counts.min()), int(counts.max())
+
+
+def _over_target(strategy, n_min, n_maj):
+    ratio = 1.0 if strategy == "auto" else float(strategy)
+    if not 0 < ratio <= 1:
+        raise ValueError("过采样 sampling_strategy 必须在 (0, 1] 或为 'auto'。")
+    target = int(round(n_maj * ratio))
+    if target < n_min:
+        raise ValueError("目标比例小于当前少数/多数比例，过采样无法减少少数类。")
+    return target
+
+
+def _under_target(strategy, n_min, n_maj):
+    ratio = 1.0 if strategy == "auto" else float(strategy)
+    if not 0 < ratio <= 1:
+        raise ValueError("欠采样 sampling_strategy 必须在 (0, 1] 或为 'auto'。")
+    target = int(round(n_min / ratio))
+    if target > n_maj:
+        raise ValueError("目标比例小于当前少数/多数比例，欠采样无法增加多数类。")
+    return target
+
+
+class RandomOverSampler:
+    def __init__(self, sampling_strategy=0.1, random_state=None, **_):
+        self.sampling_strategy, self.random_state = sampling_strategy, random_state
 
     def fit_resample(self, X, y):
+        Xf, wf = _frame(X); ys = _series(y)
+        minority, _, nmin, nmaj = _classes(ys)
+        add = _over_target(self.sampling_strategy, nmin, nmaj) - nmin
+        if add == 0:
+            return _restore(Xf, ys, wf)
         rng = np.random.RandomState(self.random_state)
-        X_arr, y_arr = _to_numpy(X, y)
+        extra = rng.choice(np.flatnonzero(ys.to_numpy() == minority), add, replace=True)
+        idx = np.r_[np.arange(len(ys)), extra]; rng.shuffle(idx)
+        return _restore(Xf.iloc[idx], ys.iloc[idx], wf)
 
-        pos_idx = np.where(y_arr == 1)[0]
-        neg_idx = np.where(y_arr == 0)[0]
-        n_pos, n_neg = len(pos_idx), len(neg_idx)
-
-        target_pos = _resolve_strategy(self.sampling_strategy, n_pos, n_neg)
-        G = target_pos - n_pos          # 总合成数
-        if G <= 0:
-            return _wrap_output(X_arr, y_arr, X)
-
-        X_pos = X_arr[pos_idx]
-        k = min(self.k_neighbors, len(X_arr) - 1)
-
-        # 计算每个正样本的"学习难度"：k 近邻中负样本占比
-        nn_all = _knn_indices(X_arr, X_pos, k)
-        r = (y_arr[nn_all] == 0).mean(axis=1).astype(float)   # (n_pos,)
-
-        r_sum = r.sum()
-        if r_sum < 1e-12:
-            # 所有正样本都是安全样本，回退到均匀 SMOTE
-            return SMOTE(self.sampling_strategy,
-                         self.k_neighbors,
-                         self.random_state).fit_resample(X, y)
-
-        r_hat = r / r_sum               # 归一化权重
-        g_i = np.round(r_hat * G).astype(int)
-
-        # 少数类内部近邻（用于插值）
-        k_pos = min(self.k_neighbors, n_pos - 1)
-        if k_pos < 1:
-            nn_pos = None
-        else:
-            nn_pos = _knn_indices(X_pos, X_pos, k_pos)
-
-        X_syn_list = []
-        for i, gi in enumerate(g_i):
-            if gi <= 0:
-                continue
-            if nn_pos is None or k_pos < 1:
-                X_syn_list.append(np.tile(X_pos[i], (gi, 1)))
-            else:
-                neighbors = nn_pos[i]
-                chosen_nb = rng.choice(neighbors, size=gi, replace=True)
-                lam = rng.uniform(0, 1, size=(gi, 1))
-                X_syn_list.append(
-                    X_pos[i] + lam * (X_pos[chosen_nb] - X_pos[i])
-                )
-
-        if not X_syn_list:
-            return _wrap_output(X_arr, y_arr, X)
-
-        X_syn = np.vstack(X_syn_list)
-        n_syn = len(X_syn)
-        X_res = np.vstack([X_arr, X_syn])
-        y_res = np.concatenate([y_arr, np.ones(n_syn, dtype=int)])
-        return _wrap_output(X_res, y_res, X)
-
-
-# ─────────────────────────────────────────────────────────────────────
-# 欠采样方法
-# ─────────────────────────────────────────────────────────────────────
 
 class RandomUnderSampler:
-    """
-    随机欠采样：随机丢弃多数类样本。
-
-    参数
-    ----
-    sampling_strategy : float
-        目标 正/负 比值（欠采样降低分母）。
-    """
-
-    def __init__(self,
-                 sampling_strategy: Union[float, str] = 0.1,
-                 random_state: Optional[int] = None):
-        self.sampling_strategy = sampling_strategy
-        self.random_state = random_state
+    def __init__(self, sampling_strategy=0.1, random_state=None, **_):
+        self.sampling_strategy, self.random_state = sampling_strategy, random_state
 
     def fit_resample(self, X, y):
+        Xf, wf = _frame(X); ys = _series(y)
+        minority, majority, nmin, nmaj = _classes(ys)
+        target = _under_target(self.sampling_strategy, nmin, nmaj)
+        if target == nmaj:
+            return _restore(Xf, ys, wf)
         rng = np.random.RandomState(self.random_state)
-        X_arr, y_arr = _to_numpy(X, y)
+        min_idx = np.flatnonzero(ys.to_numpy() == minority)
+        maj_idx = rng.choice(np.flatnonzero(ys.to_numpy() == majority), target, replace=False)
+        idx = np.r_[min_idx, maj_idx]; rng.shuffle(idx)
+        return _restore(Xf.iloc[idx], ys.iloc[idx], wf)
 
-        pos_idx = np.where(y_arr == 1)[0]
-        neg_idx = np.where(y_arr == 0)[0]
-        n_pos, n_neg = len(pos_idx), len(neg_idx)
 
-        target_neg = _resolve_under_strategy(self.sampling_strategy, n_pos, n_neg)
-        keep_neg = rng.choice(neg_idx, size=target_neg, replace=False)
-        keep_idx = np.concatenate([pos_idx, keep_neg])
-        rng.shuffle(keep_idx)
+class MixedSMOTE:
+    """SMOTENC，以及 Borderline-SMOTE/ADASYN 的混合特征扩展。"""
 
-        return _wrap_output(X_arr[keep_idx], y_arr[keep_idx], X)
+    def __init__(self, variant="smote", sampling_strategy=0.1, k_neighbors=5,
+                 m_neighbors=10, random_state=None, categorical_features=None):
+        self.variant, self.sampling_strategy = variant, sampling_strategy
+        self.k_neighbors, self.m_neighbors = k_neighbors, m_neighbors
+        self.random_state, self.categorical_features = random_state, categorical_features
+
+    def fit_resample(self, X, y):
+        Xf, wf = _frame(X); ys = _series(y)
+        minority, majority, nmin, nmaj = _classes(ys)
+        n_new = _over_target(self.sampling_strategy, nmin, nmaj) - nmin
+        if n_new == 0:
+            return _restore(Xf, ys, wf)
+        min_idx = np.flatnonzero(ys.to_numpy() == minority)
+        if len(min_idx) < 2:
+            return RandomOverSampler(self.sampling_strategy, self.random_state).fit_resample(X, y)
+
+        metric = _MetricSpace(Xf, self.categorical_features)
+        Xmin = Xf.iloc[min_idx]
+        categorical_scale = metric.categorical_scale(Xmin)
+        Z = metric.transform(Xf, categorical_scale); Zmin = Z[min_idx]
+        k = min(self.k_neighbors, len(min_idx) - 1)
+        nn_min = _nearest_neighbors_excluding_self(
+            Zmin, Zmin, np.arange(len(Zmin)), k
+        )
+        candidates = np.arange(len(min_idx))
+        weights = np.ones(len(min_idx), dtype=float)
+
+        if self.variant in ("borderline", "adasyn"):
+            m = min(self.m_neighbors if self.variant == "borderline" else self.k_neighbors,
+                    len(Xf) - 1)
+            nn_all = _nearest_neighbors_excluding_self(Z, Zmin, min_idx, m)
+            majority_ratio = (ys.to_numpy()[nn_all] == majority).mean(axis=1)
+            if self.variant == "borderline":
+                danger = (majority_ratio >= 0.5) & (majority_ratio < 1.0)
+                if not danger.any():
+                    return _restore(Xf, ys, wf)
+                candidates = np.flatnonzero(danger)
+                weights = np.ones(len(candidates))
+            else:
+                if majority_ratio.sum() == 0:
+                    raise ValueError("ADASYN 未发现含多数类近邻的少数类样本，无法进行自适应采样。")
+                weights = majority_ratio
+
+        weights = weights / weights.sum()
+        rng = np.random.RandomState(self.random_state)
+        chosen = rng.choice(candidates, n_new, replace=True, p=weights)
+        neighbor_local = np.array([rng.choice(nn_min[i]) for i in chosen])
+        lam = rng.uniform(size=(n_new, 1))
+        num_min = metric.numeric_scaled(Xmin)
+        num_syn = num_min[chosen] + lam * (num_min[neighbor_local] - num_min[chosen])
+
+        # SMOTENC：每个类别特征取所选种子的 k 个少数类近邻的众数；并列时随机打破。
+        cat_syn = pd.DataFrame(index=np.arange(n_new))
+        for c in metric.cat:
+            neighbor_values = Xmin[c].to_numpy()[nn_min[chosen]]
+            modes = []
+            for row in neighbor_values:
+                counts = pd.Series(row).value_counts(dropna=False)
+                tied_modes = counts.index[counts == counts.iloc[0]].to_numpy()
+                modes.append(rng.choice(tied_modes))
+            cat_syn[c] = modes
+        Xsyn = metric.make_rows(num_syn, cat_syn)
+        Xr = pd.concat([Xf, Xsyn], ignore_index=True)
+        yr = pd.concat([ys, pd.Series([minority] * n_new)], ignore_index=True)
+        return _restore(Xr, yr, wf)
 
 
 class TomekLinks:
-    """
-    Tomek Links 欠采样：删除互为最近邻的跨类别样本对中的多数类样本。
-    参考：Tomek (1976). Two Modifications of CNN. IEEE Trans. SMC, 6(11).
-         Batista et al. (2004). A Study of the Behavior of Several Methods
-         for Balancing Machine Learning Training Data. SIGKDD Explor., 6(1).
-
-    原理：若样本 a（少数类）和 b（多数类）互为彼此的最近邻，
-         则 (a, b) 构成一个 Tomek Link，删除 b（多数类侧）。
-    """
-
-    def __init__(self, random_state: Optional[int] = None):
-        self.random_state = random_state
+    def __init__(self, sampling_strategy="auto", categorical_features=None, **_):
+        self.sampling_strategy, self.categorical_features = sampling_strategy, categorical_features
 
     def fit_resample(self, X, y):
-        X_arr, y_arr = _to_numpy(X, y)
-        n = len(X_arr)
-
-        # 找每个样本在全体中的最近邻（1-NN，不含自身）
-        nn1 = _knn_indices(X_arr, X_arr, 1).ravel()   # (n,)
-
+        Xf, wf = _frame(X); ys = _series(y); minority, majority, _, _ = _classes(ys)
+        metric = _MetricSpace(Xf, self.categorical_features)
+        Z = metric.transform(Xf, metric.categorical_scale(Xf))
+        nn = _nearest_neighbors_excluding_self(
+            Z, Z, np.arange(len(Z)), 1
+        )[:, 0]
         remove = set()
-        for i in range(n):
-            j = nn1[i]
-            # i 和 j 互为最近邻，且类别不同
-            if nn1[j] == i and y_arr[i] != y_arr[j]:
-                # 删除多数类（y==0）
-                if y_arr[i] == 0:
-                    remove.add(i)
+        for i, j in enumerate(nn):
+            if nn[j] == i and ys.iloc[i] != ys.iloc[j]:
+                if self.sampling_strategy == "all":
+                    remove.update((i, j))
                 else:
-                    remove.add(j)
+                    remove.add(i if ys.iloc[i] == majority else j)
+        keep = np.array([i for i in range(len(ys)) if i not in remove], dtype=int)
+        self.sample_indices_ = keep
+        return _restore(Xf.iloc[keep], ys.iloc[keep], wf)
 
-        keep = np.array([i for i in range(n) if i not in remove])
-        return _wrap_output(X_arr[keep], y_arr[keep], X)
 
-
-class ENN:
-    """
-    Edited Nearest Neighbors 欠采样
-    参考：Wilson (1972). Asymptotic Properties of Nearest Neighbor Rules
-          Using Edited Data. IEEE Trans. SMC, 2(3), 408-421.
-
-    原理：对每个样本找 k 个近邻；若多数近邻与自身类别不同，则删除该样本。
-          默认只删除多数类样本（保护少数类）。
-    """
-
-    def __init__(self,
-                 k_neighbors: int = 3,
-                 kind_sel: str = "majority",
-                 random_state: Optional[int] = None):
-        """
-        kind_sel : "majority" → 只删多数类误分样本（推荐）
-                   "all"      → 删除所有被误分样本（会也删少数类噪声）
-        """
-        self.k_neighbors = k_neighbors
-        self.kind_sel = kind_sel
-        self.random_state = random_state
+class EditedNearestNeighbours:
+    def __init__(self, sampling_strategy="auto", n_neighbors=3, kind_sel="all",
+                 categorical_features=None, **_):
+        if kind_sel not in ("all", "mode"):
+            raise ValueError("ENN kind_sel 仅支持 'all' 或 'mode'。")
+        self.sampling_strategy, self.n_neighbors = sampling_strategy, n_neighbors
+        self.kind_sel, self.categorical_features = kind_sel, categorical_features
 
     def fit_resample(self, X, y):
-        X_arr, y_arr = _to_numpy(X, y)
-        n = len(X_arr)
-        k = min(self.k_neighbors, n - 1)
-
-        nn_idx = _knn_indices(X_arr, X_arr, k)
-        # 多数投票：近邻中占多数的类别
-        nn_labels = y_arr[nn_idx]           # (n, k)
-        voted = (nn_labels.mean(axis=1) >= 0.5).astype(int)  # 近邻多数类
-
-        mismatch = (voted != y_arr)
-        if self.kind_sel == "majority":
-            # 只删多数类（y==0）中被误判的
-            remove_mask = mismatch & (y_arr == 0)
+        Xf, wf = _frame(X); ys = _series(y); minority, majority, _, _ = _classes(ys)
+        metric = _MetricSpace(Xf, self.categorical_features)
+        Z = metric.transform(Xf, metric.categorical_scale(Xf))
+        k = min(self.n_neighbors, len(ys) - 1)
+        nn = _nearest_neighbors_excluding_self(
+            Z, Z, np.arange(len(Z)), k
+        )
+        labels = ys.to_numpy(); neigh = labels[nn]
+        if self.kind_sel == "all":
+            acceptable = (neigh == labels[:, None]).all(axis=1)
         else:
-            remove_mask = mismatch
+            acceptable = np.array([(pd.Series(row).mode().iloc[0] == labels[i]) for i, row in enumerate(neigh)])
+        targeted = np.ones(len(ys), dtype=bool) if self.sampling_strategy == "all" else (labels == majority)
+        keep = np.flatnonzero(~targeted | acceptable)
+        self.sample_indices_ = keep
+        return _restore(Xf.iloc[keep], ys.iloc[keep], wf)
 
-        keep = np.where(~remove_mask)[0]
-        return _wrap_output(X_arr[keep], y_arr[keep], X)
 
-
-# ─────────────────────────────────────────────────────────────────────
-# 组合方法
-# ─────────────────────────────────────────────────────────────────────
-
-class SMOTEENN:
-    """
-    SMOTE + ENN 组合采样
-    参考：Batista et al. (2004). A Study of the Behavior of Several Methods
-          for Balancing Machine Learning Training Data. SIGKDD Explor., 6(1).
-
-    两步：
-      1. SMOTE 过采样（按 sampling_strategy 生成合成正样本）
-      2. ENN 清洗（删除边界附近被误判的多数类样本）
-    """
-
-    def __init__(self,
-                 sampling_strategy: Union[float, str] = 0.1,
-                 k_neighbors: int = 5,
-                 enn_k: int = 3,
-                 random_state: Optional[int] = None):
-        self.sampling_strategy = sampling_strategy
-        self.k_neighbors = k_neighbors
-        self.enn_k = enn_k
-        self.random_state = random_state
+class CombinedSampler:
+    def __init__(self, cleaner, sampling_strategy=0.1, k_neighbors=5,
+                 random_state=None, categorical_features=None):
+        self.cleaner, self.sampling_strategy = cleaner, sampling_strategy
+        self.k_neighbors, self.random_state = k_neighbors, random_state
+        self.categorical_features = categorical_features
 
     def fit_resample(self, X, y):
-        # Step 1: SMOTE
-        X_res, y_res = SMOTE(
-            self.sampling_strategy, self.k_neighbors, self.random_state
-        ).fit_resample(X, y)
-
-        # Step 2: ENN
-        X_res, y_res = ENN(
-            k_neighbors=self.enn_k, kind_sel="majority"
-        ).fit_resample(X_res, y_res)
-
-        return X_res, y_res
-
-
-class SMOTETomek:
-    """
-    SMOTE + Tomek Links 组合采样
-    参考：Batista et al. (2004).
-
-    两步：
-      1. SMOTE 过采样
-      2. Tomek Links 清洗（删除边界处的多数类样本）
-    """
-
-    def __init__(self,
-                 sampling_strategy: Union[float, str] = 0.1,
-                 k_neighbors: int = 5,
-                 random_state: Optional[int] = None):
-        self.sampling_strategy = sampling_strategy
-        self.k_neighbors = k_neighbors
-        self.random_state = random_state
-
-    def fit_resample(self, X, y):
-        # Step 1: SMOTE
-        X_res, y_res = SMOTE(
-            self.sampling_strategy, self.k_neighbors, self.random_state
-        ).fit_resample(X, y)
-
-        # Step 2: Tomek
-        X_res, y_res = TomekLinks().fit_resample(X_res, y_res)
-
-        return X_res, y_res
-
-
-class BalanceCascade:
-    """
-    Balance Cascade（级联欠采样集成）
-    参考：Liu et al. (2009). Exploratory Undersampling for Class-Imbalance
-          Learning. IEEE Trans. SMC-B, 39(2), 539-550.
-
-    原理：
-      - 将多数类分成 T 轮，每轮：
-          1. 随机抽取负样本子集（与正样本 1:1 或按 ratio）
-          2. 构成一个平衡子集 (X_sub, y_sub)
-          3. 可选：训练一个简单分类器，把已被正确识别的负样本移除（级联）
-      - 本实现的简化版：纯随机级联（不依赖分类器），每轮抽一个不重叠子集
-
-    返回
-    ----
-    list of (X_sub, y_sub)：n_estimators 个子集，供上层做集成训练。
-
-    用法示例
-    --------
-        subsets = BalanceCascade(n_estimators=10).fit_resample(X_train, y_train)
-        models  = []
-        for X_sub, y_sub in subsets:
-            m = LGBMClassifier().fit(X_sub, y_sub)
-            models.append(m)
-        # 预测时对所有模型取概率均值
-    """
-
-    def __init__(self,
-                 n_estimators: int = 10,
-                 ratio: float = 1.0,
-                 random_state: Optional[int] = None):
-        """
-        n_estimators : 子集数量（基分类器数量）
-        ratio        : 每个子集中 负/正 的比值（默认 1:1）
-        """
-        self.n_estimators = n_estimators
-        self.ratio = ratio
-        self.random_state = random_state
-
-    def fit_resample(self, X, y) -> List[Tuple]:
-        rng = np.random.RandomState(self.random_state)
-        X_arr, y_arr = _to_numpy(X, y)
-
-        pos_idx = np.where(y_arr == 1)[0]
-        neg_idx = np.where(y_arr == 0)[0]
-        n_pos = len(pos_idx)
-
-        neg_per_sub = min(int(round(n_pos * self.ratio)), len(neg_idx))
-        # 如果负样本不够分 T 轮，允许重复
-        rng.shuffle(neg_idx)
-
-        subsets = []
-        remaining_neg = neg_idx.copy()
-
-        for t in range(self.n_estimators):
-            if len(remaining_neg) < neg_per_sub:
-                # 不够了，重新从所有负样本中采
-                sampled_neg = rng.choice(neg_idx, size=neg_per_sub, replace=False)
-            else:
-                sampled_neg = remaining_neg[:neg_per_sub]
-                remaining_neg = remaining_neg[neg_per_sub:]
-
-            sub_idx = np.concatenate([pos_idx, sampled_neg])
-            rng.shuffle(sub_idx)
-            sub_X, sub_y = _wrap_output(X_arr[sub_idx], y_arr[sub_idx], X)
-            subsets.append((sub_X, sub_y))
-
-        return subsets
+        Xo, yo = MixedSMOTE("smote", self.sampling_strategy, self.k_neighbors,
+                            random_state=self.random_state,
+                            categorical_features=self.categorical_features).fit_resample(X, y)
+        return self.cleaner.fit_resample(Xo, yo)
 
 
 class EasyEnsemble:
-    """
-    EasyEnsemble（随机欠采样集成）
-    参考：Liu et al. (2009). Exploratory Undersampling for Class-Imbalance
-          Learning. IEEE Trans. SMC-B, 39(2), 539-550.
-
-    原理：从多数类中随机独立地（有放回）抽取 T 个子集，
-         每个子集与全部少数类合并构成平衡训练集，分别训练 T 个分类器，
-         最终对 T 个分类器的输出取平均（AdaBoost 或简单均值）。
-
-    本实现：返回 T 个 (X_sub, y_sub) 子集列表，分类器训练由调用方完成。
-
-    与 BalanceCascade 的区别：
-      - BalanceCascade：级联，每轮剔除已正确识别的负样本（有记忆）
-      - EasyEnsemble  ：独立随机采样，每轮相互独立（无记忆，更简单）
-    """
-
-    def __init__(self,
-                 n_estimators: int = 10,
-                 ratio: float = 1.0,
-                 random_state: Optional[int] = None):
-        self.n_estimators = n_estimators
-        self.ratio = ratio
-        self.random_state = random_state
+    def __init__(self, n_estimators=10, ratio=1.0, random_state=None):
+        self.n_estimators, self.ratio, self.random_state = n_estimators, ratio, random_state
 
     def fit_resample(self, X, y) -> List[Tuple]:
+        if int(self.n_estimators) < 1:
+            raise ValueError("Easy Ensemble 的 n_estimators 必须 >= 1。")
+        if float(self.ratio) < 1:
+            raise ValueError("Easy Ensemble 的多数/少数比例 ratio 必须 >= 1。")
         rng = np.random.RandomState(self.random_state)
-        X_arr, y_arr = _to_numpy(X, y)
-
-        pos_idx = np.where(y_arr == 1)[0]
-        neg_idx = np.where(y_arr == 0)[0]
-        n_pos = len(pos_idx)
-        neg_per_sub = min(int(round(n_pos * self.ratio)), len(neg_idx))
-
-        subsets = []
-        for t in range(self.n_estimators):
-            seed_t = rng.randint(0, 2**31)
-            rng_t = np.random.RandomState(seed_t)
-            sampled_neg = rng_t.choice(neg_idx, size=neg_per_sub, replace=False)
-            sub_idx = np.concatenate([pos_idx, sampled_neg])
-            rng_t.shuffle(sub_idx)
-            sub_X, sub_y = _wrap_output(X_arr[sub_idx], y_arr[sub_idx], X)
-            subsets.append((sub_X, sub_y))
-
-        return subsets
+        return [RandomUnderSampler(1.0 / self.ratio, int(rng.randint(2**31 - 1))).fit_resample(X, y)
+                for _ in range(self.n_estimators)]
 
 
-# ─────────────────────────────────────────────────────────────────────
-# 工厂函数（统一入口）
-# ─────────────────────────────────────────────────────────────────────
+class BalanceCascade:
+    """遵循论文核心采样/阈值流程的二分类 Balance Cascade。
 
-def sampler_factory(method: str,
-                    sampling_strategy: Union[float, str] = 0.1,
-                    k_neighbors: int = 5,
-                    random_state: Optional[int] = None,
-                    **kwargs):
+    ``initialize`` / ``next_subset`` / ``update`` 允许调用方用真正要集成的模型逐轮驱动
+    采样。``fit_resample`` 保留便捷接口，并使用 ``estimator`` 生成同样的子集。
+    ``ratio=1`` 时对应每轮多数类子集大小等于少数类大小；其他值是扩展用法。
     """
-    采样器工厂：根据 method 字符串返回对应的采样器实例。
 
-    支持的 method（不区分大小写）
-    --------------------------------
-    过采样：
-      "smote"            → SMOTE
-      "borderline_smote" → BorderlineSMOTE
-      "adasyn"           → ADASYN
+    def __init__(self, n_estimators=10, ratio=1.0, random_state=None, estimator=None):
+        self.n_estimators, self.ratio, self.random_state = n_estimators, ratio, random_state
+        self.estimator = estimator if estimator is not None else HistGradientBoostingClassifier(
+            max_iter=100, learning_rate=0.08, random_state=random_state
+        )
 
-    欠采样：
-      "random_under"     → RandomUnderSampler
-      "tomek"            → TomekLinks（strategy/k_neighbors 无效）
-      "enn"              → ENN
+    def initialize(self, X, y):
+        if int(self.n_estimators) < 1:
+            raise ValueError("Balance Cascade 的 n_estimators 必须 >= 1。")
+        if float(self.ratio) <= 0:
+            raise ValueError("Balance Cascade 的 ratio 必须 > 0。")
 
-    组合：
-      "smoteenn"         → SMOTEENN
-      "smotetomek"       → SMOTETomek
-      "balance_cascade"  → BalanceCascade（返回子集列表）
-      "easy_ensemble"    → EasyEnsemble（返回子集列表）
+        self._X, self._was_frame = _frame(X)
+        self._y = _series(y)
+        minority, majority, n_min, n_maj = _classes(self._y)
+        self.minority_class_, self.majority_class_ = minority, majority
+        self._minority_indices = np.flatnonzero(self._y.to_numpy() == minority)
+        self._remaining_indices = np.flatnonzero(self._y.to_numpy() == majority)
+        self._target_majority_count = max(1, int(round(n_min * float(self.ratio))))
+        self.effective_n_estimators_ = (
+            1 if n_maj <= self._target_majority_count else int(self.n_estimators)
+        )
+        if self.effective_n_estimators_ == 1:
+            self.target_fpr_ = 1.0
+        else:
+            self.target_fpr_ = (
+                self._target_majority_count / n_maj
+            ) ** (1.0 / (self.effective_n_estimators_ - 1))
+        self._rng = np.random.RandomState(self.random_state)
+        self._stage = 0
+        self._awaiting_update = False
+        self.subsets_: List[Tuple] = []
+        self.estimators_: List = []
+        self.thresholds_: List[float] = []
+        self.remaining_majority_counts_ = [len(self._remaining_indices)]
+        return self
 
-    示例
-    ----
-        sampler = sampler_factory("smote", sampling_strategy=0.1, random_state=42)
-        X_res, y_res = sampler.fit_resample(X_train, y_train)
-    """
+    def has_next_subset(self) -> bool:
+        return (
+            self._stage < self.effective_n_estimators_
+            and len(self._remaining_indices) > 0
+        )
+
+    def next_subset(self):
+        if self._awaiting_update:
+            raise RuntimeError("必须先用本轮模型调用 update，再取得下一子集。")
+        if not self.has_next_subset():
+            raise StopIteration("Balance Cascade 已完成。")
+        take = min(self._target_majority_count, len(self._remaining_indices))
+        majority_indices = self._rng.choice(
+            self._remaining_indices, take, replace=False
+        )
+        indices = np.r_[self._minority_indices, majority_indices]
+        self._rng.shuffle(indices)
+        X_sub = self._X.iloc[indices].reset_index(drop=True)
+        y_sub = self._y.iloc[indices].reset_index(drop=True)
+        restored = _restore(X_sub, y_sub, self._was_frame)
+        self.subsets_.append(restored)
+        self._awaiting_update = True
+        return restored
+
+    def remaining_X(self):
+        X_remaining = self._X.iloc[self._remaining_indices]
+        return X_remaining if self._was_frame else X_remaining.to_numpy()
+
+    def update(self, scores, score_label=1):
+        """按本轮模型分数保留目标 FPR 比例的难分多数类。
+
+        ``scores`` 必须对应 ``remaining_X()``；值越大越倾向 ``score_label``。
+        对常见的二分类概率，传入正类概率并保持 ``score_label=1`` 即可。
+        """
+        if not self._awaiting_update:
+            raise RuntimeError("当前没有等待 update 的 Balance Cascade 子集。")
+        minority_scores = np.asarray(scores, dtype=float).reshape(-1)
+        if len(minority_scores) != len(self._remaining_indices):
+            raise ValueError("scores 长度必须等于当前剩余多数类样本数。")
+        if score_label != self.minority_class_:
+            minority_scores = 1.0 - minority_scores
+
+        # T 个子模型之间只有 T-1 次样本池转移；最后一轮模型训练完成后不再
+        # 进行无后续用途的多数类淘汰。这也与 target_fpr_ 的 (T-1) 次方定义一致。
+        has_following_stage = self._stage + 1 < self.effective_n_estimators_
+        threshold = np.nan
+        if has_following_stage:
+            keep_count = min(
+                len(self._remaining_indices),
+                max(1, int(round(len(self._remaining_indices) * self.target_fpr_))),
+            )
+            order = np.argsort(minority_scores, kind="mergesort")[::-1]
+            kept_local = order[:keep_count]
+            threshold = float(minority_scores[kept_local[-1]])
+            self._remaining_indices = self._remaining_indices[kept_local]
+            self.thresholds_.append(threshold)
+            self.remaining_majority_counts_.append(len(self._remaining_indices))
+        self._stage += 1
+        self._awaiting_update = False
+        return {
+            "stage": self._stage,
+            "threshold": threshold,
+            "target_fpr": self.target_fpr_,
+            "remaining_majority": len(self._remaining_indices),
+            "pruned_for_next_stage": has_following_stage,
+        }
+
+    def fit_resample(self, X, y) -> List[Tuple]:
+        self.initialize(X, y)
+        while self.has_next_subset():
+            X_sub, y_sub = self.next_subset()
+            model = clone(self.estimator).fit(X_sub, y_sub)
+            self.estimators_.append(model)
+            X_remaining = self.remaining_X()
+            if hasattr(model, "predict_proba"):
+                class_index = list(model.classes_).index(self.minority_class_)
+                scores = model.predict_proba(X_remaining)[:, class_index]
+                score_label = self.minority_class_
+            else:
+                scores = (model.predict(X_remaining) == self.minority_class_).astype(float)
+                score_label = self.minority_class_
+            self.update(scores, score_label=score_label)
+        return self.subsets_
+
+
+def sampler_factory(method: str, sampling_strategy: Union[float, str] = 0.1,
+                    k_neighbors: int = 5, random_state: Optional[int] = None,
+                    categorical_features=None, **kwargs):
     m = method.lower().replace("-", "_").replace(" ", "_")
-
+    if m in ("random_over", "randomoversampler", "oversample"):
+        return RandomOverSampler(sampling_strategy, random_state)
     if m == "smote":
-        return SMOTE(sampling_strategy, k_neighbors, random_state)
-    elif m in ("borderline_smote", "borderlinesmote"):
-        return BorderlineSMOTE(sampling_strategy, k_neighbors,
-                               kwargs.get("m_neighbors", 10), random_state)
-    elif m == "adasyn":
-        return ADASYN(sampling_strategy, k_neighbors, random_state)
-    elif m in ("random_under", "randomundersampler", "undersample"):
+        return MixedSMOTE("smote", sampling_strategy, k_neighbors,
+                          random_state=random_state, categorical_features=categorical_features)
+    if m in ("borderline_smote", "borderlinesmote"):
+        return MixedSMOTE("borderline", sampling_strategy, k_neighbors,
+                          kwargs.get("m_neighbors", 10), random_state, categorical_features)
+    if m == "adasyn":
+        return MixedSMOTE("adasyn", sampling_strategy, k_neighbors,
+                          random_state=random_state, categorical_features=categorical_features)
+    if m in ("random_under", "randomundersampler", "undersample"):
         return RandomUnderSampler(sampling_strategy, random_state)
-    elif m in ("tomek", "tomeklinks"):
-        return TomekLinks(random_state)
-    elif m == "enn":
-        return ENN(k_neighbors, kwargs.get("kind_sel", "majority"), random_state)
-    elif m in ("smoteenn", "smote_enn"):
-        return SMOTEENN(sampling_strategy, k_neighbors,
-                        kwargs.get("enn_k", 3), random_state)
-    elif m in ("smotetomek", "smote_tomek"):
-        return SMOTETomek(sampling_strategy, k_neighbors, random_state)
-    elif m in ("balance_cascade", "balancecascade"):
-        return BalanceCascade(
-            n_estimators=kwargs.get("n_estimators", 10),
-            ratio=kwargs.get("ratio", 1.0),
-            random_state=random_state,
-        )
-    elif m in ("easy_ensemble", "easyensemble", "ensemble"):
-        return EasyEnsemble(
-            n_estimators=kwargs.get("n_estimators", 10),
-            ratio=kwargs.get("ratio", 1.0),
-            random_state=random_state,
-        )
-    else:
-        raise ValueError(
-            f"未知采样方法: '{method}'。\n"
-            "支持: smote / borderline_smote / adasyn / random_under / "
-            "tomek / enn / smoteenn / smotetomek / balance_cascade / easy_ensemble / ensemble"
-        )
+    if m in ("tomek", "tomeklinks"):
+        return TomekLinks("auto", categorical_features)
+    if m == "enn":
+        return EditedNearestNeighbours("auto", k_neighbors, kwargs.get("kind_sel", "all"),
+                                       categorical_features)
+    if m in ("smoteenn", "smote_enn"):
+        cleaner = EditedNearestNeighbours("all", kwargs.get("enn_k", 3), "all", categorical_features)
+        return CombinedSampler(cleaner, sampling_strategy, k_neighbors, random_state, categorical_features)
+    if m in ("smotetomek", "smote_tomek"):
+        cleaner = TomekLinks("all", categorical_features)
+        return CombinedSampler(cleaner, sampling_strategy, k_neighbors, random_state, categorical_features)
+    if m in ("balance_cascade", "balancecascade"):
+        return BalanceCascade(kwargs.get("n_estimators", 10), kwargs.get("ratio", 1.0),
+                              random_state, kwargs.get("estimator"))
+    if m in ("easy_ensemble", "easyensemble", "ensemble"):
+        return EasyEnsemble(kwargs.get("n_estimators", 10), kwargs.get("ratio", 1.0), random_state)
+    raise ValueError("未知采样方法: " + method)
 
-
-# ─────────────────────────────────────────────────────────────────────
-# 诊断打印工具
-# ─────────────────────────────────────────────────────────────────────
 
 def print_sampling_summary(y_before, y_after, method_name: str):
-    """打印采样前后的正样本数量/比例变化。"""
-    n_before = len(y_before)
-    n_after  = len(y_after) if not isinstance(y_after, list) else sum(len(yy) for _, yy in y_after)
-
-    if isinstance(y_after, list):
-        print(f"✅ {method_name} 完成：生成 {len(y_after)} 个子集")
-        for i, (_, ys) in enumerate(y_after):
-            ys_arr = ys.values if hasattr(ys, "values") else np.asarray(ys)
-            print(f"   子集 {i:02d}: {len(ys_arr)} 样本 | 正样本率: {ys_arr.mean():.2%}")
-        return
-
-    yb = y_before.values if hasattr(y_before, "values") else np.asarray(y_before)
-    ya = y_after.values  if hasattr(y_after,  "values") else np.asarray(y_after)
-
-    print(f"✅ {method_name} 完成")
-    print(f"   样本数  : {n_before:,} → {len(ya):,}  (Δ {len(ya)-n_before:+,})")
-    print(f"   正样本率: {yb.mean():.2%} → {ya.mean():.2%}")
-    print(f"   正样本数: {int(yb.sum())} → {int(ya.sum())}")
-    print(f"   负样本数: {int((yb==0).sum())} → {int((ya==0).sum())}")
+    yb, ya = np.asarray(y_before), np.asarray(y_after)
+    print(f"[完成] {method_name}: {len(yb):,} -> {len(ya):,}; 正样本率 {yb.mean():.2%} -> {ya.mean():.2%}")

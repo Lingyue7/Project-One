@@ -24,7 +24,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)) if "__file__" in d
 
 from load_kechuang_potential_data import (
     read_data,
-    dedup_by_cst_loan,
+    report_cst_loan_duplicates,
+    deduplicate_exact_cst_loan,
     cast_cat_cols,
     rename_kechuang_cols,
     filter_by_maturity,
@@ -34,12 +35,13 @@ from load_kechuang_potential_data import (
     clean_data_potential,
     build_labels_potential,
     drop_post_label_cols,
+    PotentialFeaturePreprocessor,
 )
-from sampling_methods import sampler_factory, print_sampling_summary
+from sampling_methods import BalanceCascade, sampler_factory, print_sampling_summary
 
 # ── 参数（可被 notebook *_OVERRIDE 覆盖）────────────────────────────
 CLEANED_FILE          = globals().get("CLEANED_FILE_OVERRIDE",          "data_cleaned.csv")
-EXCEL_PATH            = globals().get("EXCEL_PATH_OVERRIDE",            "kechuang_talent_full_data0527v1.csv")
+EXCEL_PATH            = globals().get("EXCEL_PATH_OVERRIDE",            "kechuang_merged0722.csv")
 CSV_ENCODING          = globals().get("CSV_ENCODING_OVERRIDE",          "utf-8-sig")
 OUT_DIR               = globals().get("OUT_DIR_OVERRIDE",               "probability_grid_large")
 DEV_CALIBRATED_DIR = globals().get(
@@ -52,10 +54,11 @@ GRID_STEP             = float(globals().get("GRID_STEP_OVERRIDE",         500.0)
 INCLUDE_ZERO          = bool(globals().get("INCLUDE_ZERO_OVERRIDE",       True))
 SNAPSHOT_DATE         = globals().get("SNAPSHOT_DATE_OVERRIDE",          "2026-01-31")
 APPLY_MATURITY_FILTER = bool(globals().get("APPLY_MATURITY_FILTER_OVERRIDE", False))
-MATURITY_CUTOFF       = globals().get("MATURITY_CUTOFF_OVERRIDE",        "2025-12-31")
+MATURITY_CUTOFF       = globals().get("MATURITY_CUTOFF_OVERRIDE",        "2026-07-21")
 APPLY_EFF_DATE_FILTER = bool(globals().get("APPLY_EFF_DATE_FILTER_OVERRIDE", True))
-EFF_DATE_LOWER        = globals().get("EFF_DATE_LOWER_OVERRIDE",         "2024-10-01")
+EFF_DATE_LOWER        = globals().get("EFF_DATE_LOWER_OVERRIDE",         "2025-01-01")
 EFF_DATE_UPPER        = globals().get("EFF_DATE_UPPER_OVERRIDE",         "2026-03-31")
+DEDUP_CST_LOAN        = bool(globals().get("DEDUP_CST_LOAN_OVERRIDE", False))
 Y_FREQ_MODE           = globals().get("Y_FREQ_MODE_OVERRIDE",            "bout_gt0_and_curr_p80")
 HANDLE_IMBALANCE      = bool(globals().get("HANDLE_IMBALANCE_OVERRIDE",   True))
 EARLY_STOPPING_ROUNDS = int(globals().get("EARLY_STOPPING_ROUNDS_OVERRIDE", 50))
@@ -65,8 +68,55 @@ CROSS_FIT_MODE        = bool(globals().get("CROSS_FIT_MODE_OVERRIDE", False))
 CROSS_FIT_FOLDS       = int(globals().get("CROSS_FIT_FOLDS_OVERRIDE", 5))
 INNER_CROSS_FIT_FOLDS = int(globals().get("INNER_CROSS_FIT_FOLDS_OVERRIDE", 5))
 CROSS_FIT_DIR         = globals().get("CROSS_FIT_DIR_OVERRIDE", OUT_DIR + "_crossfit_calibrated")
-SAMPLING_METHOD       = globals().get("SAMPLING_METHOD_OVERRIDE", None)
-SAMPLING_STRATEGY     = globals().get("SAMPLING_STRATEGY_OVERRIDE", 1.0)
+_LEGACY_SAMPLING_METHOD = globals().get("SAMPLING_METHOD_OVERRIDE", None)
+_LEGACY_SAMPLING_STRATEGY = globals().get("SAMPLING_STRATEGY_OVERRIDE", 1.0)
+_LEGACY_SAMPLING_N_ESTIMATORS = int(
+    globals().get("SAMPLING_N_ESTIMATORS_OVERRIDE", 10)
+)
+_LEGACY_SAMPLING_ENSEMBLE_RATIO = float(
+    globals().get("SAMPLING_ENSEMBLE_RATIO_OVERRIDE", 1.0)
+)
+SAMPLING_CONFIG = {
+    "usage": {
+        "method": globals().get(
+            "SAMPLING_METHOD_USAGE_OVERRIDE", _LEGACY_SAMPLING_METHOD
+        ),
+        "strategy": globals().get(
+            "SAMPLING_STRATEGY_USAGE_OVERRIDE", _LEGACY_SAMPLING_STRATEGY
+        ),
+        "n_estimators": int(globals().get(
+            "SAMPLING_N_ESTIMATORS_USAGE_OVERRIDE",
+            _LEGACY_SAMPLING_N_ESTIMATORS,
+        )),
+        "ensemble_ratio": float(globals().get(
+            "SAMPLING_ENSEMBLE_RATIO_USAGE_OVERRIDE",
+            _LEGACY_SAMPLING_ENSEMBLE_RATIO,
+        )),
+    },
+    "default": {
+        "method": globals().get(
+            "SAMPLING_METHOD_DEFAULT_OVERRIDE", _LEGACY_SAMPLING_METHOD
+        ),
+        "strategy": globals().get(
+            "SAMPLING_STRATEGY_DEFAULT_OVERRIDE", _LEGACY_SAMPLING_STRATEGY
+        ),
+        "n_estimators": int(globals().get(
+            "SAMPLING_N_ESTIMATORS_DEFAULT_OVERRIDE",
+            _LEGACY_SAMPLING_N_ESTIMATORS,
+        )),
+        "ensemble_ratio": float(globals().get(
+            "SAMPLING_ENSEMBLE_RATIO_DEFAULT_OVERRIDE",
+            _LEGACY_SAMPLING_ENSEMBLE_RATIO,
+        )),
+    },
+}
+SAMPLING_CATEGORICAL_CANDIDATES = list(globals().get(
+    "SAMPLING_CATEGORICAL_CANDIDATES_OVERRIDE",
+    [
+        "gnd_cd", "mar_sttn_cd", "education_cd", "occup_cd", "cst_star_cd",
+        "busikind",
+    ],
+))
 
 _DEFAULT_LGB = {
     "objective":         "binary",
@@ -77,6 +127,7 @@ _DEFAULT_LGB = {
     "max_depth":         -1,
     "min_child_samples": 20,
     "subsample":         0.8,
+    "bagging_freq":      1,
     "colsample_bytree":  0.8,
     "reg_alpha":         0.1,
     "reg_lambda":        0.1,
@@ -148,90 +199,60 @@ def _fit_transform_features_train_only(
     train_idx,
     fit_scope: str = "train_only",
 ):
-    """
-    Fit every data-dependent feature rule on train only, then transform all rows.
-
-    This mirrors feature_engineering_potential without leaking calibration/test
-    missingness, medians, modes, or category vocabularies into model training.
-    """
-    drop_cols = {
-        "cst_id", "cst_id0", "y_freq", "y_dq_risk",
-        "rt_acct_stat_2_end", "split_eff_date",
-    }
-    X = work.drop(columns=[c for c in drop_cols if c in work.columns]).copy()
-    dt_cols = list(
-        X.select_dtypes(include=["datetime64[ns]", "datetime64[ns, UTC]"]).columns
+    """直接复用任务2的训练集拟合预处理器，再转换全部样本。"""
+    preprocessor = PotentialFeaturePreprocessor(
+        target="y_freq",
+        add_quota_sq=False,
+        add_quota_cube=False,
+        add_quota_log=False,
+        categorical_features=SAMPLING_CATEGORICAL_CANDIDATES,
     )
-    if dt_cols:
-        X = X.drop(columns=dt_cols)
+    preprocessor.fit(work.iloc[train_idx])
+    X = preprocessor.transform(work)
 
-    tier_order = {
-        "F3": 1, "F3级": 1, "f3": 1,
-        "F2": 2, "F2级": 2, "f2": 2,
-        "F1": 3, "F1级": 3, "f1": 3,
-        "E": 4, "E级": 4, "e": 4,
-        "D": 5, "D级": 5, "d": 5,
-        "C": 6, "C级": 6, "c": 6,
-        "B": 7, "B级": 7, "b": 7,
-        "A": 8, "A级": 8, "a": 8,
-    }
-    if "档位" in X.columns:
-        X["档位"] = (
-            X["档位"].astype(str).str.strip().map(tier_order).fillna(0).astype(int)
-        )
-
-    X_train = X.iloc[train_idx]
-    numeric_cols = list(X.select_dtypes(include=[np.number]).columns)
-    dropped_high_missing = []
-    numeric_medians = {}
-    for col in numeric_cols:
-        miss_ratio = float(X_train[col].isna().mean())
-        if miss_ratio >= 0.40:
-            dropped_high_missing.append(col)
-            continue
-        median = X_train[col].median()
-        numeric_medians[col] = float(median) if pd.notna(median) else 0.0
-
-    if dropped_high_missing:
-        X = X.drop(columns=dropped_high_missing)
-        print(
-            "  %s missingness removed %d columns (>=40%%): %s"
-            % (fit_scope, len(dropped_high_missing), dropped_high_missing)
-        )
-    for col, median in numeric_medians.items():
-        if col in X.columns:
-            X[col] = pd.to_numeric(X[col], errors="coerce").fillna(median)
-
-    categorical_cols = list(X.select_dtypes(include=["object"]).columns)
     category_metadata = {}
-    for col in categorical_cols:
-        train_col = X.iloc[train_idx][col]
-        mode = train_col.mode(dropna=True)
-        fill_value = str(mode.iloc[0]) if len(mode) else "未知"
-        train_values = train_col.fillna(fill_value).astype(str)
-        classes = sorted(train_values.unique().tolist())
-        mapping = {value: i for i, value in enumerate(classes)}
-        transformed = X[col].fillna(fill_value).astype(str).map(mapping)
-        unseen_count = int(transformed.isna().sum())
-        X[col] = transformed.fillna(-1).astype(int)
+    for col in preprocessor.categorical_features_:
+        unseen_count = int((X[col] == -1).sum())
         category_metadata[col] = {
-            "fill_value": fill_value,
-            "classes": classes,
+            "fill_value": preprocessor.categorical_fill_values_[col],
+            "classes": preprocessor.label_encoders_[col].classes_.tolist(),
             "unseen_full_rows": unseen_count,
         }
         if unseen_count:
-            print("  category %s: %d unseen values encoded as -1" % (
-                col, unseen_count))
+            print(
+                "  category %s: %d unseen values encoded as -1"
+                % (col, unseen_count)
+            )
 
-    X = X.select_dtypes(include=[np.number]).copy()
+    sampling_metadata = {}
+    for target_key in ("usage", "default"):
+        config = SAMPLING_CONFIG[target_key]
+        sampling_metadata[target_key] = {
+            "method": _sampling_method_key(target_key),
+            "strategy": config["strategy"],
+            "n_estimators": config["n_estimators"],
+            "ensemble_majority_to_minority_ratio": config["ensemble_ratio"],
+        }
     metadata = {
         "fit_scope": fit_scope,
         "split_ratios": list(SPLIT_RATIOS),
-        "dropped_high_missing_columns": dropped_high_missing,
-        "numeric_medians": numeric_medians,
+        "preprocessor": "PotentialFeaturePreprocessor (task2 synchronized)",
+        "dropped_high_missing_columns": preprocessor.dropped_high_missing_,
+        "numeric_medians": preprocessor.numeric_fill_values_,
         "categorical_rules": category_metadata,
+        "categorical_features": preprocessor.categorical_features_,
         "feature_names": X.columns.tolist(),
+        "sampling_config": sampling_metadata,
     }
+    if preprocessor.dropped_high_missing_:
+        print(
+            "  %s missingness removed %d columns (>=40%%): %s"
+            % (
+                fit_scope,
+                len(preprocessor.dropped_high_missing_),
+                preprocessor.dropped_high_missing_,
+            )
+        )
     print("  feature engineering fit_scope=%s: %d features" % (fit_scope, X.shape[1]))
     return X, metadata
 
@@ -251,7 +272,9 @@ def _load_or_preprocess() -> pd.DataFrame:
     print(f"[1/5] 未找到 {CLEANED_FILE}，从原始文件重跑预处理: {EXCEL_PATH}")
     df0 = read_data(EXCEL_PATH, csv_encoding=CSV_ENCODING)
     df0 = rename_kechuang_cols(df0)
-    df0 = dedup_by_cst_loan(df0)
+    df0 = report_cst_loan_duplicates(df0)
+    if DEDUP_CST_LOAN:
+        df0 = deduplicate_exact_cst_loan(df0)
     df0 = cast_cat_cols(df0)
     df0 = filter_by_maturity(
         df0, apply_filter=APPLY_MATURITY_FILTER, maturity_cutoff=MATURITY_CUTOFF
@@ -282,14 +305,39 @@ def _load_or_preprocess() -> pd.DataFrame:
     return work
 
 
-def _build_lgb_params(y: pd.Series) -> dict:
+def _sampling_method_key(target_key):
+    """Return one target's canonical task-2 sampling method name."""
+    if target_key not in SAMPLING_CONFIG:
+        raise KeyError("target_key must be 'usage' or 'default'")
+    method_value = SAMPLING_CONFIG[target_key]["method"]
+    if method_value is None:
+        return "baseline"
+    method = str(method_value).strip().lower().replace("-", "_").replace(" ", "_")
+    if method in ("", "none", "baseline"):
+        return "baseline"
+    aliases = {
+        "balancecascade": "balance_cascade",
+        "easyensemble": "easy_ensemble",
+        "ensemble": "easy_ensemble",
+    }
+    return aliases.get(method, method)
+
+
+def _build_lgb_params(y: pd.Series, target_key: str) -> dict:
     """从 LGB_PARAMS 构造 LightGBM 训练参数字典，支持 HANDLE_IMBALANCE。"""
     params = dict(LGB_PARAMS)
     n_estimators = int(params.pop("n_estimators", 500))
     params.pop("verbose", None)
     params["verbosity"] = -1
+    params.pop("scale_pos_weight", None)
 
-    if HANDLE_IMBALANCE:
+    method = _sampling_method_key(target_key)
+    if method != "baseline":
+        print(
+            "    %s sampling=%s，禁用 scale_pos_weight，避免重复处理类别不平衡"
+            % (target_key, method)
+        )
+    elif HANDLE_IMBALANCE:
         n_neg = int((y == 0).sum())
         n_pos = int((y == 1).sum())
         if n_pos > 0:
@@ -304,10 +352,25 @@ def _build_lgb_params(y: pd.Series) -> dict:
     return params, n_estimators
 
 
-def _train_lgb(X: pd.DataFrame, y: pd.Series, label: str) -> lgb.Booster:
+def _train_lgb(
+    X: pd.DataFrame,
+    y: pd.Series,
+    label: str,
+    categorical_features=None,
+    target_key: str = "usage",
+) -> lgb.Booster:
     print(f"  → 训练 {label} 模型…")
-    params, n_rounds = _build_lgb_params(y)
-    ds = lgb.Dataset(X, label=y, feature_name=X.columns.tolist(), free_raw_data=False)
+    params, n_rounds = _build_lgb_params(y, target_key)
+    categorical_features = [
+        col for col in (categorical_features or []) if col in X.columns
+    ]
+    ds = lgb.Dataset(
+        X,
+        label=y,
+        feature_name=X.columns.tolist(),
+        categorical_feature=categorical_features,
+        free_raw_data=False,
+    )
     train_kwargs = {
         "num_boost_round": n_rounds,
         "valid_sets": [ds],
@@ -318,6 +381,43 @@ def _train_lgb(X: pd.DataFrame, y: pd.Series, label: str) -> lgb.Booster:
         train_kwargs["verbose_eval"] = 50
     booster = lgb.train(params, ds, **train_kwargs)
     return booster
+
+
+def _predict_model(model, X):
+    """Predict with one LightGBM booster or average an ensemble's probabilities."""
+    if isinstance(model, (list, tuple)):
+        if not model:
+            raise ValueError("模型集成不能为空。")
+        return np.mean([member.predict(X) for member in model], axis=0)
+    return model.predict(X)
+
+
+def _save_model_bundle(model, path, target_key):
+    """Preserve the old single-model path and save ensemble members with a manifest."""
+    if not isinstance(model, (list, tuple)):
+        model.save_model(path)
+        return [path]
+
+    stem, ext = os.path.splitext(path)
+    ext = ext or ".txt"
+    member_paths = []
+    for index, member in enumerate(model, start=1):
+        member_path = "%s_member_%02d%s" % (stem, index, ext)
+        member.save_model(member_path)
+        member_paths.append(member_path)
+    manifest_path = stem + "_ensemble.json"
+    with open(manifest_path, "w", encoding="utf-8") as manifest_file:
+        json.dump(
+            {
+                "aggregation": "mean_probability",
+                "sampling_method": _sampling_method_key(target_key),
+                "members": member_paths,
+            },
+            manifest_file,
+            ensure_ascii=False,
+            indent=2,
+        )
+    return member_paths + [manifest_path]
 
 
 def _build_grid() -> np.ndarray:
@@ -353,8 +453,8 @@ def _predict_probability_grid(
     X_scan = X_base_np.copy()
     for j, L in enumerate(grid):
         X_scan[:, quota_col_idx] = float(L)
-        p_usage[:, j] = booster_usage.predict(X_scan).astype(np.float32)
-        p_default[:, j] = booster_default.predict(X_scan).astype(np.float32)
+        p_usage[:, j] = _predict_model(booster_usage, X_scan).astype(np.float32)
+        p_default[:, j] = _predict_model(booster_default, X_scan).astype(np.float32)
         if (j + 1) % 200 == 0 or j + 1 == m:
             print(f"    进度: {j+1}/{m} ({(j+1)/m*100:.1f}%)")
 
@@ -379,27 +479,102 @@ def _calibrate_matrix(calibrator, matrix, chunk_size=1000000):
     return out.reshape(matrix.shape)
 
 
-def _sample_training_only(X, y, label):
-    """Apply the development-stage sampler to model-training rows only."""
-    method = None if SAMPLING_METHOD in (None, "", "none", "None") else str(SAMPLING_METHOD)
-    if method is None:
+def _sample_training_only(X, y, label, categorical_features, target_key):
+    """Apply the fixed task-2 sampler to model-training rows only."""
+    config = SAMPLING_CONFIG[target_key]
+    method = _sampling_method_key(target_key)
+    if method == "baseline":
         print("    %s: no resampling" % label)
         return X, y
-    if method.lower() in ("balance_cascade", "easy_ensemble", "easyensemble", "ensemble"):
-        raise ValueError(
-            "Cross-fit currently expects a single resampled training set; "
-            "choose a non-ensemble development method (for example smote/borderline_smote/random_under)."
+
+    if method in ("balance_cascade", "easy_ensemble"):
+        sampler = sampler_factory(
+            method,
+            random_state=RANDOM_STATE,
+            n_estimators=config["n_estimators"],
+            ratio=config["ensemble_ratio"],
+            categorical_features=categorical_features,
         )
-    sampler = sampler_factory(
-        method,
-        sampling_strategy=SAMPLING_STRATEGY,
-        random_state=RANDOM_STATE,
-    )
-    X_res, y_res = sampler.fit_resample(X, y)
+    else:
+        sampler = sampler_factory(
+            method,
+            sampling_strategy=config["strategy"],
+            random_state=RANDOM_STATE,
+            categorical_features=categorical_features,
+        )
+
+    if method == "balance_cascade":
+        # The actual LightGBM members trained below must drive each pruning transition.
+        return sampler.initialize(X, y)
+
+    sampled = sampler.fit_resample(X, y)
+    if isinstance(sampled, list):
+        for index, (_, y_subset) in enumerate(sampled, start=1):
+            print_sampling_summary(y, y_subset, "%s/%s subset%d" % (label, method, index))
+        return sampled
+
+    X_res, y_res = sampled
     X_res = pd.DataFrame(X_res, columns=X.columns)
     y_res = pd.Series(np.asarray(y_res, dtype=int))
     print_sampling_summary(y, y_res, "%s/%s" % (label, method))
     return X_res, y_res
+
+
+def _train_sampled(sampled, label, categorical_features, target_key):
+    """Train one model, Easy Ensemble members, or a classifier-driven cascade."""
+    if isinstance(sampled, BalanceCascade):
+        models = []
+        while sampled.has_next_subset():
+            model_index = len(models) + 1
+            X_subset, y_subset = sampled.next_subset()
+            print_sampling_summary(
+                sampled._y,
+                y_subset,
+                "%s/balance_cascade subset%d" % (label, model_index),
+            )
+            model = _train_lgb(
+                X_subset,
+                y_subset,
+                "%s cascade %d/%d" % (
+                    label,
+                    model_index,
+                    sampled.effective_n_estimators_,
+                ),
+                categorical_features,
+                target_key,
+            )
+            models.append(model)
+            remaining_probability = _predict_model(model, sampled.remaining_X())
+            cascade_info = sampled.update(remaining_probability, score_label=1)
+            if cascade_info["pruned_for_next_stage"]:
+                print(
+                    "    cascade stage %d: target_fpr=%.4f, threshold=%.6f, "
+                    "next majority=%d"
+                    % (
+                        cascade_info["stage"],
+                        cascade_info["target_fpr"],
+                        cascade_info["threshold"],
+                        cascade_info["remaining_majority"],
+                    )
+                )
+        return models
+
+    if isinstance(sampled, list):
+        return [
+            _train_lgb(
+                X_subset,
+                y_subset,
+                "%s ensemble %d/%d" % (label, index, len(sampled)),
+                categorical_features,
+                target_key,
+            )
+            for index, (X_subset, y_subset) in enumerate(sampled, start=1)
+        ]
+
+    X_train, y_train = sampled
+    return _train_lgb(
+        X_train, y_train, label, categorical_features, target_key
+    )
 
 
 def _crossfit_time_folds(work):
@@ -475,23 +650,38 @@ def _run_crossfit():
                 inner_train_idx,
                 fit_scope="outer_%d_inner_%d_train_only" % (fold + 1, inner_fold + 1),
             )
-            X_u_inner, y_u_inner = _sample_training_only(
-                X_inner.iloc[inner_train_idx], y_usage.iloc[inner_train_idx], "usage"
+            categorical_inner = metadata_inner["categorical_features"]
+            sampled_u_inner = _sample_training_only(
+                X_inner.iloc[inner_train_idx],
+                y_usage.iloc[inner_train_idx],
+                "usage",
+                categorical_inner,
+                "usage",
             )
-            X_d_inner, y_d_inner = _sample_training_only(
-                X_inner.iloc[inner_train_idx], y_default.iloc[inner_train_idx], "default"
+            sampled_d_inner = _sample_training_only(
+                X_inner.iloc[inner_train_idx],
+                y_default.iloc[inner_train_idx],
+                "default",
+                categorical_inner,
+                "default",
             )
-            booster_u_inner = _train_lgb(
-                X_u_inner, y_u_inner, "usage outer %d inner %d" % (fold + 1, inner_fold + 1)
+            booster_u_inner = _train_sampled(
+                sampled_u_inner,
+                "usage outer %d inner %d" % (fold + 1, inner_fold + 1),
+                categorical_inner,
+                "usage",
             )
-            booster_d_inner = _train_lgb(
-                X_d_inner, y_d_inner, "default outer %d inner %d" % (fold + 1, inner_fold + 1)
+            booster_d_inner = _train_sampled(
+                sampled_d_inner,
+                "default outer %d inner %d" % (fold + 1, inner_fold + 1),
+                categorical_inner,
+                "default",
             )
             inner_limit_idx = _nearest_grid_indices(work.iloc[inner_pred_idx][QUOTA_COL], grid)
             X_inner_pred = X_inner.iloc[inner_pred_idx].copy()
             X_inner_pred.loc[:, QUOTA_COL] = grid[inner_limit_idx]
-            raw_u_inner[inner_pred_idx] = booster_u_inner.predict(X_inner_pred)
-            raw_d_inner[inner_pred_idx] = booster_d_inner.predict(X_inner_pred)
+            raw_u_inner[inner_pred_idx] = _predict_model(booster_u_inner, X_inner_pred)
+            raw_d_inner[inner_pred_idx] = _predict_model(booster_d_inner, X_inner_pred)
             inner_metadata["inner_%d" % (inner_fold + 1)] = metadata_inner
 
         if np.isnan(raw_u_inner[build_idx]).any() or np.isnan(raw_d_inner[build_idx]).any():
@@ -509,14 +699,33 @@ def _run_crossfit():
         X_outer, metadata_outer = _fit_transform_features_train_only(
             work, build_idx, fit_scope="outer_%d_all_build" % (fold + 1)
         )
-        X_u_outer, y_u_outer = _sample_training_only(
-            X_outer.iloc[build_idx], y_usage.iloc[build_idx], "usage"
+        categorical_outer = metadata_outer["categorical_features"]
+        sampled_u_outer = _sample_training_only(
+            X_outer.iloc[build_idx],
+            y_usage.iloc[build_idx],
+            "usage",
+            categorical_outer,
+            "usage",
         )
-        X_d_outer, y_d_outer = _sample_training_only(
-            X_outer.iloc[build_idx], y_default.iloc[build_idx], "default"
+        sampled_d_outer = _sample_training_only(
+            X_outer.iloc[build_idx],
+            y_default.iloc[build_idx],
+            "default",
+            categorical_outer,
+            "default",
         )
-        booster_u = _train_lgb(X_u_outer, y_u_outer, "usage outer %d final" % (fold + 1))
-        booster_d = _train_lgb(X_d_outer, y_d_outer, "default outer %d final" % (fold + 1))
+        booster_u = _train_sampled(
+            sampled_u_outer,
+            "usage outer %d final" % (fold + 1),
+            categorical_outer,
+            "usage",
+        )
+        booster_d = _train_sampled(
+            sampled_d_outer,
+            "default outer %d final" % (fold + 1),
+            categorical_outer,
+            "default",
+        )
         raw_u_pred, raw_d_pred = _predict_probability_grid(
             X_outer.iloc[pred_idx], booster_u, booster_d, grid
         )
@@ -578,22 +787,25 @@ if not CROSS_FIT_MODE:
     print(f"  特征数={len(feat_names)}")
 
     print("\n[3/5] 训练 LightGBM（使用训练集+验证集75%，固定采样仅作用于开发拟合集）…")
-    X_usage_train, y_usage_train = _sample_training_only(
-        X_usage.iloc[fit_idx], y_usage.iloc[fit_idx], "usage"
+    categorical_features = preprocessing_metadata["categorical_features"]
+    sampled_usage = _sample_training_only(
+        X_usage.iloc[fit_idx], y_usage.iloc[fit_idx], "usage", categorical_features,
+        "usage",
     )
-    X_default_train, y_default_train = _sample_training_only(
-        X_default.iloc[fit_idx], y_default.iloc[fit_idx], "default"
+    sampled_default = _sample_training_only(
+        X_default.iloc[fit_idx], y_default.iloc[fit_idx], "default", categorical_features,
+        "default",
     )
-    booster_usage = _train_lgb(
-        X_usage_train, y_usage_train, "y_freq (usage)"
+    booster_usage = _train_sampled(
+        sampled_usage, "y_freq (usage)", categorical_features, "usage"
     )
-    booster_default = _train_lgb(
-        X_default_train, y_default_train, "y_dq_risk (default)"
+    booster_default = _train_sampled(
+        sampled_default, "y_dq_risk (default)", categorical_features, "default"
     )
 
     os.makedirs("saved_models", exist_ok=True)
-    booster_usage.save_model("saved_models/booster_usage.txt")
-    booster_default.save_model("saved_models/booster_default.txt")
+    _save_model_bundle(booster_usage, "saved_models/booster_usage.txt", "usage")
+    _save_model_bundle(booster_default, "saved_models/booster_default.txt", "default")
     print("  模型已保存到 saved_models/")
 
     print("\n[4/5] 生成概率网格…")

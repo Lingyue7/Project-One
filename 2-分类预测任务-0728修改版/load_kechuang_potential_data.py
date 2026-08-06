@@ -38,7 +38,7 @@
   9.   feature_engineering_potential    —— 缺失删列/填充、LabelEncoder、档位有序编码、授信额度多项式
 """
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -623,7 +623,7 @@ def filter_by_maturity(
 
 def filter_by_eff_date(
     df: pd.DataFrame,
-    eff_date_lower: str = "2024-10-01",
+    eff_date_lower: str = "2025-01-01",
     eff_date_upper: str = "2026-03-31",
 ) -> pd.DataFrame:
     """
@@ -640,8 +640,8 @@ def filter_by_eff_date(
     参数
     ----
     df             : 行级 DataFrame（每行一笔贷款，列名已小写）
-    eff_date_lower : 生效日下限（含），默认 "2024-10-01"
-                     对应消费偏好表最早快照 2024-09-30（X_SNAP_DT>=2024-09-30）
+    eff_date_lower : 生效日下限（含），默认 "2025-01-01"
+                     与两项建模任务的统一样本窗口保持一致
     eff_date_upper : 生效日上限（含），默认 "2026-03-31"
                      对应消费偏好表最晚快照 2026-02-28（X_SNAP_DT<=2026-02-28）
     """
@@ -1407,6 +1407,7 @@ class PotentialFeaturePreprocessor:
         add_quota_cube: bool = True,
         add_quota_log: bool = False,
         missing_threshold: float = 0.4,
+        categorical_features: Optional[Sequence[str]] = None,
     ):
         if target not in ("y_freq", "y_dq_risk"):
             raise ValueError("target 仅支持 'y_freq' 或 'y_dq_risk'")
@@ -1417,6 +1418,13 @@ class PotentialFeaturePreprocessor:
         self.add_quota_cube = add_quota_cube
         self.add_quota_log = add_quota_log
         self.missing_threshold = float(missing_threshold)
+        self.explicit_categorical_features = set(categorical_features or [])
+        invalid_categorical = self.explicit_categorical_features & {"age", "档位"}
+        if invalid_categorical:
+            raise ValueError(
+                "age 是连续变量、档位是有序变量，不能作为无序类别特征: "
+                f"{sorted(invalid_categorical)}"
+            )
 
     def _prepare_features(self, work: pd.DataFrame) -> pd.DataFrame:
         X = work.drop(
@@ -1456,7 +1464,9 @@ class PotentialFeaturePreprocessor:
         )
         categorical_cols = [
             col for col in X.columns
-            if col in dtype_categorical or col in self._KNOWN_CATEGORICAL
+            if col in dtype_categorical
+            or col in self._KNOWN_CATEGORICAL
+            or col in self.explicit_categorical_features
         ]
         numeric_cols = [
             col for col in X.select_dtypes(include=[np.number]).columns
@@ -1588,9 +1598,12 @@ def load_kechuang_potential(
     maturity_cutoff: str = "2026-07-21",
     y_freq_mode: str = "bout_gt0_and_curr_p80",
     apply_eff_date_filter: bool = False,
-    eff_date_lower: str = "2024-10-01",
+    eff_date_lower: str = "2025-01-01",
     eff_date_upper: str = "2026-03-31",
     dedup_cst_loan: bool = False,
+    exclude_dq_start_customers: Optional[bool] = None,
+    label_threshold_train_ratio: Optional[float] = None,
+    require_dual_label_cohort: bool = False,
 ) -> Tuple[
     pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series,
     List[str], Dict[str, float], pd.DataFrame, pd.DataFrame,
@@ -1617,9 +1630,12 @@ def load_kechuang_potential(
                                "curr_p80_only"          → ac_curr_bal_diff>=P80（单条件）
                                "curr_p80_and_bout_p80"  → ac_curr_bal_diff>=P80 且 ba_out_bal_diff>=P80
     apply_eff_date_filter  : 是否执行生效日筛选（True=筛选，False=跳过），默认 False
-    eff_date_lower         : 生效日下限（含），默认 "2024-10-01"（对应消费偏好表最早快照）
+    eff_date_lower         : 生效日下限（含），默认 "2025-01-01"
     eff_date_upper         : 生效日上限（含），默认 "2026-03-31"（对应消费偏好表最晚快照）
     dedup_cst_loan         : True 时仅删除字段完全一致的重复账户；冲突重复会报错
+    exclude_dq_start_customers : 是否剔除起点已违约客户；None 时仅 y_dq_risk 剔除
+    label_threshold_train_ratio: y_freq 的 P80 仅用最早该比例客户拟合；None 表示全样本
+    require_dual_label_cohort  : True 时同时要求 y_freq 来源和 y_dq 终点状态完整
 
     返回
     ----
@@ -1727,8 +1743,13 @@ def load_kechuang_potential(
         print("  apply_eff_date_filter=False，跳过生效日筛选")
     _count_dq_rows(df0, "生效日筛选后（行级）")
 
-    if target == "y_dq_risk":
-        print("[3.7/8] 剔除起点已违约客户（仅 y_dq_risk 模式）...")
+    exclude_dq_start = (
+        target == "y_dq_risk"
+        if exclude_dq_start_customers is None
+        else bool(exclude_dq_start_customers)
+    )
+    if exclude_dq_start:
+        print("[3.7/8] 剔除起点已违约客户（统一建模客户池）...")
         df0 = filter_dq_start_customers(df0)
         _count_dq_rows(df0, "起点违约剔除后（行级）")
 
@@ -1737,12 +1758,51 @@ def load_kechuang_potential(
     _count_dq_agg(df1, "聚合后（客户级，一客一行）")
 
     print("[5/8] 数据清洗 Part1（因变量构造前：删ID/日期/无意义字段）...")
-    df2 = clean_data_potential(df1, snapshot_date=snapshot_date, target=target)
+    clean_target = "y_dq_risk" if require_dual_label_cohort else target
+    df2 = clean_data_potential(
+        df1, snapshot_date=snapshot_date, target=clean_target
+    )
     _count_dq_agg(df2, "清洗Part1后（客户级）")
 
     label_desc = f"y_freq（模式={y_freq_mode}）" if target == "y_freq" else "y_dq_risk"
     print(f"[6/8] 因变量构造（{label_desc}）...")
-    df3, thresholds = build_labels_potential(df2, target=target, y_freq_mode=y_freq_mode)
+    threshold_fit_mask = None
+    if (target == "y_freq" or require_dual_label_cohort) and label_threshold_train_ratio is not None:
+        ratio = float(label_threshold_train_ratio)
+        if not 0 < ratio < 1:
+            raise ValueError("label_threshold_train_ratio 必须在 (0, 1) 内。")
+        if "split_eff_date" not in df2.columns:
+            raise KeyError("按时间拟合 y_freq 阈值需要 split_eff_date。")
+        label_dates = pd.to_datetime(df2["split_eff_date"], errors="coerce")
+        if label_dates.isna().any():
+            raise ValueError(
+                f"split_eff_date 存在 {int(label_dates.isna().sum()):,} 个无效值，"
+                "无法按时间拟合 y_freq 阈值。"
+            )
+        label_order = np.argsort(label_dates.to_numpy(), kind="mergesort")
+        n_threshold_train = int(len(df2) * ratio)
+        if n_threshold_train <= 0:
+            raise ValueError("y_freq 阈值训练段为空。")
+        threshold_fit_mask = np.zeros(len(df2), dtype=bool)
+        threshold_fit_mask[label_order[:n_threshold_train]] = True
+    if require_dual_label_cohort:
+        df3, thresholds_freq = build_labels_potential(
+            df2,
+            target="y_freq",
+            y_freq_mode=y_freq_mode,
+            threshold_fit_mask=threshold_fit_mask,
+        )
+        df3, thresholds_dq = build_labels_potential(
+            df3, target="y_dq_risk"
+        )
+        thresholds = thresholds_freq if target == "y_freq" else thresholds_dq
+    else:
+        df3, thresholds = build_labels_potential(
+            df2,
+            target=target,
+            y_freq_mode=y_freq_mode,
+            threshold_fit_mask=threshold_fit_mask,
+        )
     if target == "y_dq_risk" and "y_dq_risk" in df3.columns:
         n_pos = int(df3["y_dq_risk"].sum())
         total  = len(df3)
@@ -1751,7 +1811,8 @@ def load_kechuang_potential(
         print(f"  +-- y_dq_risk=0={total - n_pos:,}")
 
     print("[6.5/8] 数据清洗 Part2（因变量构造后：删泄露/diff/起点无意义字段）...")
-    df_clean = drop_post_label_cols(df3, target=target)
+    drop_target = "y_dq_risk" if require_dual_label_cohort else target
+    df_clean = drop_post_label_cols(df3, target=drop_target)
     if target == "y_dq_risk" and "y_dq_risk" in df_clean.columns:
         n_pos = int(df_clean["y_dq_risk"].sum())
         total  = len(df_clean)

@@ -26,6 +26,42 @@ import warnings
 warnings.filterwarnings('ignore')
 
 
+def build_dual_labels_train_threshold(
+    df_clean: pd.DataFrame,
+    y_freq_mode: str,
+    train_ratio: float = 0.60,
+):
+    """按时间顺序训练段拟合 y_freq 阈值，再构造两个目标标签。"""
+    from load_kechuang_potential_data import build_labels_potential
+
+    if not 0 < float(train_ratio) < 1:
+        raise ValueError("train_ratio 必须在 (0, 1) 内。")
+    if "split_eff_date" not in df_clean.columns:
+        raise KeyError("双标签无泄漏构造需要 split_eff_date。")
+    dates = pd.to_datetime(df_clean["split_eff_date"], errors="coerce")
+    if dates.isna().any():
+        raise ValueError(
+            f"split_eff_date 存在 {int(dates.isna().sum()):,} 个无效值，"
+            "无法按时间拟合 y_freq 阈值。"
+        )
+    order = np.argsort(dates.to_numpy(), kind="mergesort")
+    n_train = int(len(df_clean) * float(train_ratio))
+    if n_train <= 0:
+        raise ValueError("训练段为空，无法拟合 y_freq 阈值。")
+    train_mask = np.zeros(len(df_clean), dtype=bool)
+    train_mask[order[:n_train]] = True
+    labeled, thresholds_usage = build_labels_potential(
+        df_clean,
+        target="y_freq",
+        y_freq_mode=y_freq_mode,
+        threshold_fit_mask=train_mask,
+    )
+    labeled, thresholds_default = build_labels_potential(
+        labeled, target="y_dq_risk"
+    )
+    return labeled, thresholds_usage, thresholds_default
+
+
 def _sns_set_style(style="whitegrid", context="talk"):
     """兼容旧版 seaborn：统一用 set_style/set_context，不调用 set_theme。"""
     try:
@@ -65,12 +101,14 @@ class OptimalCreditLimitConfig:
         self.cleaned_file = None
         self.csv_encoding = "utf-8-sig"
         self.snapshot_date = "2026-01-31"
-        self.maturity_cutoff = "2025-12-31"
+        self.maturity_cutoff = "2026-07-21"
         self.apply_maturity_filter = False
         self.apply_eff_date_filter = True
-        self.eff_date_lower = "2024-10-01"
+        self.eff_date_lower = "2025-01-01"
         self.eff_date_upper = "2026-03-31"
+        self.dedup_cst_loan = False
         self.y_freq_mode = "bout_gt0_and_curr_p80"
+        self.label_threshold_train_ratio = 0.60
         # 使用全样本参与训练与额度优化；如需加速，可在 main 中临时覆盖该值
         self.max_samples = None  # 最大样本数，None表示使用全部样本，可设置为100、200、500等
         
@@ -146,7 +184,8 @@ class OptimalCreditLimitCalculator:
         """加载并预处理数据（load_kechuang_potential_data）。"""
         from load_kechuang_potential_data import (
             read_data,
-            dedup_by_cst_loan,
+            report_cst_loan_duplicates,
+            deduplicate_exact_cst_loan,
             cast_cat_cols,
             rename_kechuang_cols,
             filter_by_maturity,
@@ -154,7 +193,6 @@ class OptimalCreditLimitCalculator:
             filter_dq_start_customers,
             aggregate_by_customer_potential,
             clean_data_potential,
-            build_labels_potential,
             drop_post_label_cols,
             feature_engineering_potential,
         )
@@ -178,17 +216,19 @@ class OptimalCreditLimitCalculator:
             print(f"  从原始文件预处理: {excel_path}")
             df0 = read_data(excel_path, csv_encoding=csv_encoding)
             df0 = rename_kechuang_cols(df0)
-            df0 = dedup_by_cst_loan(df0)
+            df0 = report_cst_loan_duplicates(df0)
+            if bool(getattr(self.config, "dedup_cst_loan", False)):
+                df0 = deduplicate_exact_cst_loan(df0)
             df0 = cast_cat_cols(df0)
             df0 = filter_by_maturity(
                 df0,
                 apply_filter=bool(getattr(self.config, "apply_maturity_filter", False)),
-                maturity_cutoff=str(getattr(self.config, "maturity_cutoff", "2025-12-31")),
+                maturity_cutoff=str(getattr(self.config, "maturity_cutoff", "2026-07-21")),
             )
             if bool(getattr(self.config, "apply_eff_date_filter", True)):
                 df0 = filter_by_eff_date(
                     df0,
-                    eff_date_lower=str(getattr(self.config, "eff_date_lower", "2024-10-01")),
+                    eff_date_lower=str(getattr(self.config, "eff_date_lower", "2025-01-01")),
                     eff_date_upper=str(getattr(self.config, "eff_date_upper", "2026-03-31")),
                 )
             df0 = filter_dq_start_customers(df0)
@@ -199,10 +239,13 @@ class OptimalCreditLimitCalculator:
                 target="y_dq_risk",
             )
             y_freq_mode = str(getattr(self.config, "y_freq_mode", "bout_gt0_and_curr_p80"))
-            df_labeled, thr_usage = build_labels_potential(
-                df_clean, target="y_freq", y_freq_mode=y_freq_mode
+            df_labeled, thr_usage, thr_default = build_dual_labels_train_threshold(
+                df_clean,
+                y_freq_mode=y_freq_mode,
+                train_ratio=float(getattr(
+                    self.config, "label_threshold_train_ratio", 0.60
+                )),
             )
-            df_labeled, thr_default = build_labels_potential(df_labeled, target="y_dq_risk")
             work = drop_post_label_cols(df_labeled, target="y_dq_risk")
             df0 = df_agg
 

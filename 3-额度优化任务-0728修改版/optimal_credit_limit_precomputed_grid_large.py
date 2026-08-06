@@ -33,7 +33,8 @@ OPTIMIZER_STATE_VERSION = "parameter_selected_portfolio_milp_v2"
 
 from load_kechuang_potential_data import (
     read_data,
-    dedup_by_cst_loan,
+    report_cst_loan_duplicates,
+    deduplicate_exact_cst_loan,
     cast_cat_cols,
     rename_kechuang_cols,
     filter_by_maturity,
@@ -41,13 +42,13 @@ from load_kechuang_potential_data import (
     filter_dq_start_customers,
     aggregate_by_customer_potential,
     clean_data_potential,
-    build_labels_potential,
     drop_post_label_cols,
     feature_engineering_potential,
 )
 from optimal_credit_limit import (
     OptimalCreditLimitConfig,
     OptimalCreditLimitCalculator,
+    build_dual_labels_train_threshold,
 )
 from portfolio_milp_optimizer import (
     concentration_shares,
@@ -74,10 +75,11 @@ class LargePrecomputedGridConfig(OptimalCreditLimitConfig):
         self.csv_encoding = "utf-8-sig"
         self.snapshot_date = "2026-01-31"
         self.apply_maturity_filter = False
-        self.maturity_cutoff = "2025-12-31"
+        self.maturity_cutoff = "2026-07-21"
         self.apply_eff_date_filter = True
-        self.eff_date_lower = "2024-10-01"
+        self.eff_date_lower = "2025-01-01"
         self.eff_date_upper = "2026-03-31"
+        self.dedup_cst_loan = False
         self.y_freq_mode = "bout_gt0_and_curr_p80"
         # 人才等级只进入额度区间及组均额度约束，不再作为收益乘数。
         self.lgd_coefficient = 0.45
@@ -120,17 +122,19 @@ class LargePrecomputedGridCalculator(OptimalCreditLimitCalculator):
             print(f"  未找到 {cleaned_file}，从原始文件重跑预处理: {excel_path}")
             df0 = read_data(excel_path, csv_encoding=csv_encoding)
             df0 = rename_kechuang_cols(df0)
-            df0 = dedup_by_cst_loan(df0)
+            df0 = report_cst_loan_duplicates(df0)
+            if bool(getattr(self.config, "dedup_cst_loan", False)):
+                df0 = deduplicate_exact_cst_loan(df0)
             df0 = cast_cat_cols(df0)
             df0 = filter_by_maturity(
                 df0,
                 apply_filter=bool(getattr(self.config, "apply_maturity_filter", False)),
-                maturity_cutoff=str(getattr(self.config, "maturity_cutoff", "2025-12-31")),
+                maturity_cutoff=str(getattr(self.config, "maturity_cutoff", "2026-07-21")),
             )
             if bool(getattr(self.config, "apply_eff_date_filter", True)):
                 df0 = filter_by_eff_date(
                     df0,
-                    eff_date_lower=str(getattr(self.config, "eff_date_lower", "2024-10-01")),
+                    eff_date_lower=str(getattr(self.config, "eff_date_lower", "2025-01-01")),
                     eff_date_upper=str(getattr(self.config, "eff_date_upper", "2026-03-31")),
                 )
             else:
@@ -143,10 +147,13 @@ class LargePrecomputedGridCalculator(OptimalCreditLimitCalculator):
                 target="y_dq_risk",
             )
             y_freq_mode = str(getattr(self.config, "y_freq_mode", "bout_gt0_and_curr_p80"))
-            df_labeled, _ = build_labels_potential(
-                df_clean, target="y_freq", y_freq_mode=y_freq_mode
+            df_labeled, _, _ = build_dual_labels_train_threshold(
+                df_clean,
+                y_freq_mode=y_freq_mode,
+                train_ratio=float(getattr(
+                    self.config, "label_threshold_train_ratio", 0.60
+                )),
             )
-            df_labeled, _ = build_labels_potential(df_labeled, target="y_dq_risk")
             work = drop_post_label_cols(df_labeled, target="y_dq_risk")
 
         if "credamt" in work.columns and "授信额度" not in work.columns:
@@ -1432,7 +1439,7 @@ def main():
 
     # ── 从 notebook Cell 1 读取覆盖参数（%run 时全局变量已注入）──────────
     _g = globals()
-    _excel_path    = _g.get("EXCEL_PATH_OPT_OVERRIDE",   _g.get("DATA_FILE", "kechuang_talent_full_data0527v1.csv"))
+    _excel_path    = _g.get("EXCEL_PATH_OPT_OVERRIDE",   _g.get("DATA_FILE", "kechuang_merged0722.csv"))
     _prob_grid_dir = _g.get("PROB_GRID_DIR_OPT_OVERRIDE", _g.get("PROB_GRID_DIR", "probability_grid_large"))
     _reports_dir   = _g.get("REPORTS_DIR_OPT_OVERRIDE",   _g.get("REPORTS_DIR",  "reports"))
     _interest_rate = float(_g.get("INTEREST_RATE_OPT_OVERRIDE", _g.get("INTEREST_RATE", 0.03)))
@@ -1484,9 +1491,10 @@ def main():
     config.csv_encoding     = _g.get("CSV_ENCODING_OPT_OVERRIDE", _g.get("CSV_ENCODING", "utf-8-sig"))
     config.snapshot_date    = _g.get("SNAPSHOT_DATE_OPT_OVERRIDE", _g.get("SNAPSHOT_DATE", "2026-01-31"))
     config.apply_maturity_filter = bool(_g.get("APPLY_MATURITY_FILTER_OPT_OVERRIDE", _g.get("APPLY_MATURITY_FILTER", False)))
-    config.maturity_cutoff  = _g.get("MATURITY_CUTOFF_OPT_OVERRIDE", _g.get("MATURITY_CUTOFF", "2025-12-31"))
+    config.maturity_cutoff  = _g.get("MATURITY_CUTOFF_OPT_OVERRIDE", _g.get("MATURITY_CUTOFF", "2026-07-21"))
     config.apply_eff_date_filter = bool(_g.get("APPLY_EFF_DATE_FILTER_OPT_OVERRIDE", _g.get("APPLY_EFF_DATE_FILTER", True)))
-    config.eff_date_lower   = _g.get("EFF_DATE_LOWER_OPT_OVERRIDE", _g.get("EFF_DATE_LOWER", "2024-10-01"))
+    config.dedup_cst_loan = bool(_g.get("DEDUP_CST_LOAN_OPT_OVERRIDE", _g.get("DEDUP_CST_LOAN", False)))
+    config.eff_date_lower   = _g.get("EFF_DATE_LOWER_OPT_OVERRIDE", _g.get("EFF_DATE_LOWER", "2025-01-01"))
     config.eff_date_upper   = _g.get("EFF_DATE_UPPER_OPT_OVERRIDE", _g.get("EFF_DATE_UPPER", "2026-03-31"))
     config.y_freq_mode      = _g.get("Y_FREQ_MODE_OPT_OVERRIDE", _g.get("Y_FREQ_MODE", "bout_gt0_and_curr_p80"))
     config.lgd_coefficient  = _lgd
