@@ -2,7 +2,7 @@
 
 本目录提供一套面向科创人才历史客户的授信额度组合优化流程。系统先在不同候选额度下预测客户的支用概率和违约概率，再根据历史数据计算优化参数，并在额度预算、风险预算和人才等级政策约束下，为每名客户选择一个可执行的离散建议额度。
 
-推荐从 `credit_limit_optimization.ipynb` 开始运行。Notebook 串联数据清洗、四段时间划分、概率模型与校准、优化参数计算、`c2` 候选比较、最终测试集离线评价、全量历史客户交叉拟合优化、诊断和可视化。
+推荐从 `credit_limit_optimization.ipynb` 开始运行。Notebook 串联数据清洗、四段双标签联合分层随机划分、概率模型与校准、优化参数计算、`c2` 候选比较、最终测试集离线评价、全量历史客户交叉拟合优化、诊断和可视化。
 
 ## 前置步骤：先完整运行任务2两次
 
@@ -22,7 +22,7 @@
 | `parameter_selection.py` | 计算平均支用率与 `c1`、历史回收法 LGD、人才等级额度上限，并保存参数审计结果。 |
 | `load_kechuang_potential_data.py` | 与任务2同步的数据口径：安全重复检查、账户到客户聚合、双标签构造、缺失标签排除和训练集拟合特征处理。 |
 | `sampling_methods.py` | 与任务2同步的类别不平衡采样工具；距离型方法在训练数据内拟合 RobustScaler，混合特征按 SMOTENC 规则处理。 |
-| `generate_probability_grid.py` | 执行时间划分、训练支用/违约模型并生成开发阶段和全量折外校准概率网格。 |
+| `generate_probability_grid.py` | 执行与任务2同步的双标签联合分层随机划分、训练支用/违约模型并生成开发阶段和全量折外校准概率网格。 |
 | `probability_calibration.py` | Isotonic 校准、Brier Score、ECE 和校准曲线评估工具。 |
 | `portfolio_milp_optimizer.py` | 构造并求解离散 0-1 组合整数规划。 |
 | `optimal_credit_limit_precomputed_grid_large.py` | 读取概率网格，运行 `c2` 敏感性分析或正式优化，输出组合评价报告。 |
@@ -37,8 +37,8 @@
     ↓
 客户级聚合、双标签构造、泄露字段删除
     ↓
-按时间划分 train / validation / calibration / final test
-            60%          15%          15%          10%
+按 y_freq × y_dq_risk 联合分层随机划分
+ train / validation / calibration / final test = 60% / 15% / 15% / 10%
     ↓
 固定采样方法后，用 train+validation 重新训练开发模型
     ↓
@@ -57,7 +57,7 @@ final test 一次性离线评价
 
 ## 数据划分与概率口径
 
-历史客户按 `split_eff_date` 稳定排序，默认划分为：
+历史客户按 `y_freq × y_dq_risk` 四种联合标签组合分层随机划分，比例与随机种子均和任务2一致。这样两个目标共用同一批 train / validation / calibration / final test 客户，并同时尽量保持两个目标的正负样本比例：
 
 | 数据集 | 比例 | 用途 |
 | --- | ---: | --- |
@@ -76,7 +76,7 @@ probability_grid_large_dev_calibrated/
 
 其中保存 `train_idx.npy`、`validation_idx.npy`、`fit_idx.npy`、`cal_idx.npy` 和 `test_idx.npy`，供后续步骤检查数据边界。
 
-全量历史客户优化使用嵌套交叉拟合生成的样本外校准概率。每个外层目标折的标签不进入对应模型或校准器。目录默认是：
+全量历史客户优化使用嵌套交叉拟合生成的样本外校准概率。外层折和内部校准折同样按双标签联合分层随机划分；每个外层目标折的标签不进入对应模型或校准器。该随机划分不能替代更晚时点的 OOT 验证。目录默认是：
 
 ```text
 probability_grid_large_crossfit_calibrated/

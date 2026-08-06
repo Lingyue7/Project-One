@@ -31,7 +31,7 @@ def build_dual_labels_train_threshold(
     y_freq_mode: str,
     train_ratio: float = 0.60,
 ):
-    """按时间顺序训练段拟合 y_freq 阈值，再构造两个目标标签。"""
+    """用最早参考客户拟合 y_freq 阈值；该范围不是随机模型训练集。"""
     from load_kechuang_potential_data import build_labels_potential
 
     if not 0 < float(train_ratio) < 1:
@@ -42,19 +42,19 @@ def build_dual_labels_train_threshold(
     if dates.isna().any():
         raise ValueError(
             f"split_eff_date 存在 {int(dates.isna().sum()):,} 个无效值，"
-            "无法按时间拟合 y_freq 阈值。"
+            "无法按最早客户参考期拟合 y_freq 阈值。"
         )
     order = np.argsort(dates.to_numpy(), kind="mergesort")
-    n_train = int(len(df_clean) * float(train_ratio))
-    if n_train <= 0:
-        raise ValueError("训练段为空，无法拟合 y_freq 阈值。")
-    train_mask = np.zeros(len(df_clean), dtype=bool)
-    train_mask[order[:n_train]] = True
+    n_reference = int(len(df_clean) * float(train_ratio))
+    if n_reference <= 0:
+        raise ValueError("标签阈值参考客户为空，无法拟合 y_freq 阈值。")
+    reference_mask = np.zeros(len(df_clean), dtype=bool)
+    reference_mask[order[:n_reference]] = True
     labeled, thresholds_usage = build_labels_potential(
         df_clean,
         target="y_freq",
         y_freq_mode=y_freq_mode,
-        threshold_fit_mask=train_mask,
+        threshold_fit_mask=reference_mask,
     )
     labeled, thresholds_default = build_labels_potential(
         labeled, target="y_dq_risk"

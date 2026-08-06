@@ -17,6 +17,7 @@ from load_kechuang_potential_data import (
     get_customer_static_conflicts,
     get_feature_descriptive_stats,
     load_kechuang_potential,
+    stratified_dual_target_partition_indices,
 )
 
 
@@ -287,6 +288,35 @@ class PotentialFeaturePreprocessorTests(unittest.TestCase):
 
         self.assertIn("age", numeric["字段"].tolist())
         self.assertNotIn("age", categorical["字段"].tolist())
+
+    def test_dual_target_stratified_split_is_exact_reproducible_and_balanced(self):
+        n_rows = 1200
+        row_number = np.arange(n_rows)
+        work = pd.DataFrame({
+            "y_freq": (row_number % 5 == 0).astype(int),
+            "y_dq_risk": (row_number % 7 == 0).astype(int),
+        })
+        proportions = (0.60, 0.15, 0.15, 0.10)
+
+        first = stratified_dual_target_partition_indices(
+            work, proportions, random_state=42
+        )
+        second = stratified_dual_target_partition_indices(
+            work, proportions, random_state=42
+        )
+
+        self.assertEqual([len(part) for part in first], [720, 180, 180, 120])
+        combined = np.concatenate(first)
+        self.assertEqual(len(np.unique(combined)), n_rows)
+        np.testing.assert_array_equal(np.sort(combined), row_number)
+        for first_part, second_part in zip(first, second):
+            np.testing.assert_array_equal(first_part, second_part)
+            for target in ("y_freq", "y_dq_risk"):
+                self.assertEqual(work.iloc[first_part][target].nunique(), 2)
+                self.assertLess(
+                    abs(work.iloc[first_part][target].mean() - work[target].mean()),
+                    0.01,
+                )
 
 
 if __name__ == "__main__":

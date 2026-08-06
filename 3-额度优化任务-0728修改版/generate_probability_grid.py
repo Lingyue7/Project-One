@@ -36,6 +36,7 @@ from load_kechuang_potential_data import (
     build_labels_potential,
     drop_post_label_cols,
     PotentialFeaturePreprocessor,
+    stratified_dual_target_partition_indices,
 )
 from sampling_methods import BalanceCascade, sampler_factory, print_sampling_summary
 
@@ -139,43 +140,22 @@ LGB_PARAMS = globals().get("LGB_PARAMS_OVERRIDE", _DEFAULT_LGB)
 QUOTA_COL = "credamt"
 
 
-def _time_split_indices(work: pd.DataFrame):
-    """Create a stable 60/15/15/10 chronological split before feature fitting."""
+def _stratified_split_indices(work: pd.DataFrame):
+    """Create the task-2-compatible joint-stratified random development split."""
     if len(SPLIT_RATIOS) != 4 or not np.isclose(sum(SPLIT_RATIOS), 1.0):
         raise ValueError("SPLIT_RATIOS must contain four values summing to 1")
-    if "split_eff_date" not in work.columns:
-        raise ValueError(
-            "data_cleaned.csv is missing split_eff_date; rerun Cell 3 before Cell 5"
+    work = work.reset_index(drop=True)
+    train_idx, validation_idx, cal_idx, test_idx = (
+        stratified_dual_target_partition_indices(
+            work,
+            SPLIT_RATIOS,
+            random_state=RANDOM_STATE,
         )
-
-    dates = pd.to_datetime(work["split_eff_date"], errors="coerce")
-    valid = dates.notna()
-    if not valid.all():
-        print("  WARNING: dropping %d rows with invalid split_eff_date" % int((~valid).sum()))
-        work = work.loc[valid].reset_index(drop=True)
-        dates = dates.loc[valid].reset_index(drop=True)
-    else:
-        work = work.reset_index(drop=True)
-        dates = dates.reset_index(drop=True)
-
-    order = np.argsort(dates.to_numpy(), kind="mergesort")
-    n = len(work)
-    n_train = int(n * SPLIT_RATIOS[0])
-    n_validation = int(n * SPLIT_RATIOS[1])
-    n_cal = int(n * SPLIT_RATIOS[2])
-    train_idx = np.asarray(order[:n_train], dtype=int)
-    validation_end = n_train + n_validation
-    cal_end = validation_end + n_cal
-    validation_idx = np.asarray(order[n_train:validation_end], dtype=int)
-    cal_idx = np.asarray(order[validation_end:cal_end], dtype=int)
-    test_idx = np.asarray(order[cal_end:], dtype=int)
+    )
     fit_idx = np.sort(np.concatenate([train_idx, validation_idx])).astype(int)
 
-    if min(len(train_idx), len(validation_idx), len(cal_idx), len(test_idx)) == 0:
-        raise ValueError("At least one chronological split is empty")
-
     print(
-        "  chronological split train/validation/cal/test = %d/%d/%d/%d "
+        "  joint-stratified random split train/validation/cal/test = %d/%d/%d/%d "
         "(%.0f%%/%.0f%%/%.0f%%/%.0f%%)"
         % (
             len(train_idx), len(validation_idx), len(cal_idx), len(test_idx),
@@ -189,9 +169,36 @@ def _time_split_indices(work: pd.DataFrame):
         ("cal", cal_idx),
         ("test", test_idx),
     ]:
-        split_dates = dates.iloc[idx]
-        print("    %-10s %s -> %s" % (name, split_dates.min(), split_dates.max()))
+        print(
+            "    %-10s y_freq=%6.2f%% | y_dq_risk=%6.2f%%"
+            % (
+                name,
+                work.iloc[idx]["y_freq"].mean() * 100,
+                work.iloc[idx]["y_dq_risk"].mean() * 100,
+            )
+        )
     return work, train_idx, validation_idx, cal_idx, test_idx, fit_idx
+
+
+def _label_threshold_reference_mask(work: pd.DataFrame):
+    """Select the earliest 60% only for fitting data-driven y_freq thresholds."""
+    if "split_eff_date" not in work.columns:
+        raise ValueError(
+            "data_cleaned.csv is missing split_eff_date; cannot fit the y_freq threshold"
+        )
+    dates = pd.to_datetime(work["split_eff_date"], errors="coerce")
+    if dates.isna().any():
+        raise ValueError(
+            "split_eff_date contains %d invalid rows; cannot fit the y_freq threshold"
+            % int(dates.isna().sum())
+        )
+    order = np.argsort(dates.to_numpy(), kind="mergesort")
+    reference_count = int(len(work) * SPLIT_RATIOS[0])
+    if reference_count <= 0:
+        raise ValueError("The y_freq threshold reference cohort is empty")
+    mask = np.zeros(len(work), dtype=bool)
+    mask[np.asarray(order[:reference_count], dtype=int)] = True
+    return mask
 
 
 def _fit_transform_features_train_only(
@@ -290,9 +297,7 @@ def _load_or_preprocess() -> pd.DataFrame:
     df_clean = clean_data_potential(
         df_agg, snapshot_date=SNAPSHOT_DATE, target="y_dq_risk"
     )
-    df_clean, label_train_idx, _, _, _, _ = _time_split_indices(df_clean)
-    label_train_mask = np.zeros(len(df_clean), dtype=bool)
-    label_train_mask[label_train_idx] = True
+    label_train_mask = _label_threshold_reference_mask(df_clean)
     df_labeled, _ = build_labels_potential(
         df_clean,
         target="y_freq",
@@ -577,17 +582,20 @@ def _train_sampled(sampled, label, categorical_features, target_key):
     )
 
 
-def _crossfit_time_folds(work):
-    """Five mutually exclusive, near-equal chronological folds by account opening date."""
-    if "split_eff_date" not in work.columns:
-        raise ValueError("data_cleaned.csv missing split_eff_date; rerun Cell 3")
-    dates = pd.to_datetime(work["split_eff_date"], errors="coerce")
-    if dates.isna().any():
-        raise ValueError("split_eff_date contains %d invalid rows" % int(dates.isna().sum()))
-    order = np.argsort(dates.to_numpy(), kind="mergesort")
+def _crossfit_stratified_folds(work):
+    """Create mutually exclusive joint-stratified random outer folds."""
+    fold_parts = stratified_dual_target_partition_indices(
+        work,
+        np.repeat(1.0 / CROSS_FIT_FOLDS, CROSS_FIT_FOLDS),
+        random_state=RANDOM_STATE,
+    )
     fold_id = np.empty(len(work), dtype=np.int16)
-    for fold, idx in enumerate(np.array_split(order, CROSS_FIT_FOLDS)):
+    for fold, idx in enumerate(fold_parts):
         fold_id[idx] = fold
+    if "split_eff_date" in work.columns:
+        dates = pd.to_datetime(work["split_eff_date"], errors="coerce")
+    else:
+        dates = pd.Series(pd.NaT, index=work.index, dtype="datetime64[ns]")
     return dates, fold_id
 
 
@@ -598,7 +606,7 @@ def _run_crossfit():
         raise ValueError("INNER_CROSS_FIT_FOLDS must be at least 2")
 
     work = _load_or_preprocess().reset_index(drop=True)
-    dates, fold_id = _crossfit_time_folds(work)
+    dates, fold_id = _crossfit_stratified_folds(work)
     y_usage = work["y_freq"].astype(int).reset_index(drop=True)
     y_default = work["y_dq_risk"].astype(int).reset_index(drop=True)
     customer_id = work["cst_id"].astype(str).to_numpy()
@@ -637,8 +645,12 @@ def _run_crossfit():
         # 内部折外未校准概率；目标外层折标签不参与这里任何训练。
         raw_u_inner = np.full(len(work), np.nan, dtype=float)
         raw_d_inner = np.full(len(work), np.nan, dtype=float)
-        build_sorted = build_idx[np.argsort(dates.iloc[build_idx].to_numpy(), kind="mergesort")]
-        inner_parts = [np.asarray(x, dtype=int) for x in np.array_split(build_sorted, INNER_CROSS_FIT_FOLDS)]
+        inner_relative_parts = stratified_dual_target_partition_indices(
+            work.iloc[build_idx].reset_index(drop=True),
+            np.repeat(1.0 / INNER_CROSS_FIT_FOLDS, INNER_CROSS_FIT_FOLDS),
+            random_state=RANDOM_STATE + fold + 1,
+        )
+        inner_parts = [build_idx[np.asarray(x, dtype=int)] for x in inner_relative_parts]
         inner_metadata = {}
         for inner_fold, inner_pred_idx in enumerate(inner_parts):
             inner_train_idx = np.setdiff1d(build_idx, inner_pred_idx, assume_unique=False)
@@ -758,7 +770,8 @@ def _run_crossfit():
         json.dump(preprocessing_all, f, ensure_ascii=False, indent=2)
     with open(os.path.join(CROSS_FIT_DIR, "calibration_method.txt"), "w", encoding="utf-8") as f:
         f.write(
-            "%d-fold chronological outer cross-fitting; %d-fold inner OOF calibration; isotonic\n"
+            "%d-fold joint-stratified random outer cross-fitting; "
+            "%d-fold joint-stratified random inner OOF calibration; isotonic\n"
             % (CROSS_FIT_FOLDS, INNER_CROSS_FIT_FOLDS)
         )
     print("\nCross-fitted calibrated probability grid saved to %s" % CROSS_FIT_DIR)
@@ -771,7 +784,7 @@ if CROSS_FIT_MODE:
 # ── 主流程 ───────────────────────────────────────────────────────────
 if not CROSS_FIT_MODE:
     work = _load_or_preprocess()
-    work, train_idx, validation_idx, cal_idx, test_idx, fit_idx = _time_split_indices(work)
+    work, train_idx, validation_idx, cal_idx, test_idx, fit_idx = _stratified_split_indices(work)
     print(f"  y_freq 正例: {work['y_freq'].mean():.2%}  |  "
           f"y_dq_risk 正例: {work['y_dq_risk'].mean():.2%}")
     print(f"  y_freq 模式: {Y_FREQ_MODE}")

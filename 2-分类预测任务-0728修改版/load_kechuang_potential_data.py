@@ -799,11 +799,11 @@ def aggregate_by_customer_potential(df_raw: pd.DataFrame) -> pd.DataFrame:
         )
     df = df_raw.copy()
 
-    # ── 开户日期副本（供概率校准的时间切分使用，不参与建模） ──
+    # ── 开户日期副本（供 y_freq 阈值参考期与审计使用，不参与建模） ──
     # 原始 rt_acct_eff_date_1 会在后续 clean/drop 阶段被删除（防泄露），
     # 这里额外复制一列 split_eff_date 并解析为 datetime，一客多贷取最早一笔的开户日。
     # 该列为 datetime 类型，在 feature_engineering_potential 中会被显式删除，
-    # 因此不会进入模型，仅保留在 work/data_cleaned.csv 中供切分排序。
+    # 因此不会进入模型，仅保留在 work/data_cleaned.csv 中供阈值参考期和审计使用。
     if "rt_acct_eff_date_1" in df.columns:
         _eff = pd.to_datetime(df["rt_acct_eff_date_1"], format="%d%b%Y", errors="coerce")
         _failed = _eff.isna()
@@ -899,7 +899,7 @@ def aggregate_by_customer_potential(df_raw: pd.DataFrame) -> pd.DataFrame:
         if c in df.columns:
             agg_dict[c] = "first"
 
-    # 开户日期副本：一客多贷取最早开户日（min），供时间切分排序
+    # 开户日期副本：一客多贷取最早开户日（min），供阈值参考期和审计使用
     if "split_eff_date" in df.columns:
         agg_dict["split_eff_date"] = "min"
 
@@ -1228,7 +1228,7 @@ def build_labels_potential(
     threshold_source = work.loc[fit_mask]
     threshold_scope = (
         "all valid rows" if threshold_fit_mask is None
-        else "train only (%d valid rows)" % len(threshold_source)
+        else "reference cohort only (%d valid rows)" % len(threshold_source)
     )
     n_total = len(work)
 
@@ -1303,6 +1303,111 @@ def build_labels_potential(
 
     thresholds.update({"thr_bout": thr_bout, "thr_curr": thr_curr, "thr_accr": thr_accr})
     return work, thresholds
+
+
+def stratified_dual_target_partition_indices(
+    work: pd.DataFrame,
+    proportions,
+    random_state: int = 42,
+):
+    """按 y_freq × y_dq_risk 联合标签随机分层，并返回位置索引分区。"""
+    proportions = np.asarray(proportions, dtype=float)
+    if proportions.ndim != 1 or len(proportions) < 2:
+        raise ValueError("proportions 至少需要两个分区比例。")
+    if np.any(proportions <= 0) or not np.isclose(proportions.sum(), 1.0):
+        raise ValueError("proportions 必须全部大于0且合计为1。")
+    if len(work) < len(proportions):
+        raise ValueError("样本数少于分区数，无法执行分层划分。")
+
+    label_cols = ["y_freq", "y_dq_risk"]
+    missing_cols = [col for col in label_cols if col not in work.columns]
+    if missing_cols:
+        raise KeyError(f"联合分层缺少标签列: {missing_cols}")
+    labels = work[label_cols].apply(pd.to_numeric, errors="coerce")
+    if labels.isna().any().any():
+        missing_counts = labels.isna().sum().to_dict()
+        raise ValueError(f"联合分层标签存在缺失值: {missing_counts}")
+    invalid = ~labels.isin([0, 1])
+    if invalid.any().any():
+        raise ValueError("联合分层仅支持0/1二分类标签。")
+
+    strata = (
+        labels["y_freq"].astype(int).to_numpy() * 2
+        + labels["y_dq_risk"].astype(int).to_numpy()
+    )
+    stratum_values = np.sort(np.unique(strata))
+    n_parts = len(proportions)
+    target_counts = np.floor(len(work) * proportions).astype(int)
+    target_counts[-1] = len(work) - int(target_counts[:-1].sum())
+
+    allocations = np.zeros((len(stratum_values), n_parts), dtype=int)
+    ideal = np.zeros_like(allocations, dtype=float)
+    for row, stratum in enumerate(stratum_values):
+        stratum_count = int(np.sum(strata == stratum))
+        ideal[row] = stratum_count * proportions
+        allocations[row] = np.floor(ideal[row]).astype(int)
+        remainder = stratum_count - int(allocations[row].sum())
+        if remainder:
+            fractional_order = np.argsort(
+                -(ideal[row] - allocations[row]), kind="mergesort"
+            )
+            allocations[row, fractional_order[:remainder]] += 1
+
+    # 各联合标签层先按比例取整后，总分区人数可能相差1~数人；在层内移动配额，
+    # 使最终分区人数严格等于配置值，同时尽量保持联合标签比例。
+    while True:
+        column_delta = target_counts - allocations.sum(axis=0)
+        receivers = np.flatnonzero(column_delta > 0)
+        donors = np.flatnonzero(column_delta < 0)
+        if not len(receivers) and not len(donors):
+            break
+        if not len(receivers) or not len(donors):
+            raise RuntimeError("联合分层配额无法与目标分区人数对齐。")
+        receiver = int(receivers[0])
+        donor = int(donors[0])
+        candidates = np.flatnonzero(allocations[:, donor] > 0)
+        if not len(candidates):
+            raise RuntimeError("联合分层没有可移动的层内样本配额。")
+        move_cost = []
+        for row in candidates:
+            before = (
+                abs(allocations[row, donor] - ideal[row, donor])
+                + abs(allocations[row, receiver] - ideal[row, receiver])
+            )
+            after = (
+                abs(allocations[row, donor] - 1 - ideal[row, donor])
+                + abs(allocations[row, receiver] + 1 - ideal[row, receiver])
+            )
+            move_cost.append(after - before)
+        selected_row = int(candidates[int(np.argmin(move_cost))])
+        allocations[selected_row, donor] -= 1
+        allocations[selected_row, receiver] += 1
+
+    rng = np.random.RandomState(int(random_state))
+    partitions = [[] for _ in range(n_parts)]
+    for row, stratum in enumerate(stratum_values):
+        stratum_indices = np.flatnonzero(strata == stratum)
+        rng.shuffle(stratum_indices)
+        start = 0
+        for part in range(n_parts):
+            end = start + int(allocations[row, part])
+            partitions[part].extend(stratum_indices[start:end].tolist())
+            start = end
+
+    result = tuple(np.sort(np.asarray(part, dtype=int)) for part in partitions)
+    combined = np.concatenate(result)
+    if len(combined) != len(work) or len(np.unique(combined)) != len(work):
+        raise RuntimeError("联合分层结果未完整且唯一地覆盖全部样本。")
+    for part_number, part in enumerate(result, start=1):
+        if not len(part):
+            raise ValueError(f"联合分层第{part_number}个分区为空。")
+        for label_col in label_cols:
+            if work.iloc[part][label_col].nunique() < 2:
+                raise ValueError(
+                    f"联合分层第{part_number}个分区的 {label_col} 只有一个类别；"
+                    "请增加正样本或减少分区数。"
+                )
+    return result
 
 
 # ─────────────────────────────────────────────
@@ -1772,19 +1877,19 @@ def load_kechuang_potential(
         if not 0 < ratio < 1:
             raise ValueError("label_threshold_train_ratio 必须在 (0, 1) 内。")
         if "split_eff_date" not in df2.columns:
-            raise KeyError("按时间拟合 y_freq 阈值需要 split_eff_date。")
+            raise KeyError("按最早客户参考期拟合 y_freq 阈值需要 split_eff_date。")
         label_dates = pd.to_datetime(df2["split_eff_date"], errors="coerce")
         if label_dates.isna().any():
             raise ValueError(
                 f"split_eff_date 存在 {int(label_dates.isna().sum()):,} 个无效值，"
-                "无法按时间拟合 y_freq 阈值。"
+                "无法按最早客户参考期拟合 y_freq 阈值。"
             )
         label_order = np.argsort(label_dates.to_numpy(), kind="mergesort")
-        n_threshold_train = int(len(df2) * ratio)
-        if n_threshold_train <= 0:
-            raise ValueError("y_freq 阈值训练段为空。")
+        n_threshold_reference = int(len(df2) * ratio)
+        if n_threshold_reference <= 0:
+            raise ValueError("y_freq 阈值参考客户为空。")
         threshold_fit_mask = np.zeros(len(df2), dtype=bool)
-        threshold_fit_mask[label_order[:n_threshold_train]] = True
+        threshold_fit_mask[label_order[:n_threshold_reference]] = True
     if require_dual_label_cohort:
         df3, thresholds_freq = build_labels_potential(
             df2,
