@@ -7,14 +7,13 @@
 4. Balance Cascade 按目标假阳性率逐轮保留难分多数类，并由实际子模型驱动级联。
 """
 
-from __future__ import annotations
 
 from typing import List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
 from sklearn.base import clone
-from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import OneHotEncoder, RobustScaler
 
@@ -359,8 +358,8 @@ class BalanceCascade:
 
     def __init__(self, n_estimators=10, ratio=1.0, random_state=None, estimator=None):
         self.n_estimators, self.ratio, self.random_state = n_estimators, ratio, random_state
-        self.estimator = estimator if estimator is not None else HistGradientBoostingClassifier(
-            max_iter=100, learning_rate=0.08, random_state=random_state
+        self.estimator = estimator if estimator is not None else GradientBoostingClassifier(
+            n_estimators=100, learning_rate=0.08, random_state=random_state
         )
 
     def initialize(self, X, y):
