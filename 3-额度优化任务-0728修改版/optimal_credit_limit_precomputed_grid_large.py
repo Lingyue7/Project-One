@@ -29,7 +29,7 @@ from typing import Optional, Tuple
 import numpy as np
 import pandas as pd
 
-OPTIMIZER_STATE_VERSION = "parameter_selected_portfolio_milp_v3"
+OPTIMIZER_STATE_VERSION = "sample_aligned_probability_grid_v4"
 
 from load_kechuang_potential_data import (
     read_data,
@@ -214,6 +214,30 @@ class LargePrecomputedGridCalculator(OptimalCreditLimitCalculator):
         print("概率网格读取完成")
         return self.models
 
+    def _subset_data_rows_only(self, idx, label: str):
+        """在概率矩阵载入前，仅把客户表/特征裁剪到网格客户并保持同序。"""
+        idx = np.asarray(idx, dtype=int).reshape(-1)
+        n_before = len(self.data_info["df_aggregated"])
+        if not len(idx) or len(np.unique(idx)) != len(idx):
+            raise ValueError(f"{label} 的客户索引为空或存在重复。")
+        if np.any(idx < 0) or np.any(idx >= n_before):
+            raise IndexError(f"{label} 的客户索引超出 0~{n_before - 1}。")
+        for key in (
+            "df_raw", "df_aggregated", "df_cleaned",
+            "X_usage", "y_usage", "X_default", "y_default",
+        ):
+            value = self.data_info.get(key)
+            if value is None:
+                continue
+            if len(value) != n_before:
+                raise ValueError(
+                    f"{label} 前 data_info[{key}] 长度={len(value)}，期望={n_before}。"
+                )
+            self.data_info[key] = value.iloc[idx].reset_index(drop=True)
+        self.source_row_indices = idx.copy()
+        self.scope_row_indices = idx.copy()
+        print(f"[{label}] 客户数: {n_before:,} -> {len(idx):,}")
+
     def _subset_aligned_rows(self, idx, label: str):
         """同步裁剪客户表、特征/标签和四套概率矩阵，防止样本边界错位。"""
         idx = np.asarray(idx, dtype=int).reshape(-1)
@@ -272,11 +296,15 @@ class LargePrecomputedGridCalculator(OptimalCreditLimitCalculator):
         """将同一概率网格限定为开发拟合客户、最终测试客户或全部客户。"""
         scope = str(scope or "all").strip().lower()
         n_current = len(self.data_info["df_aggregated"])
-        self.source_row_indices = np.arange(n_current, dtype=int)
+        if not hasattr(self, "source_row_indices") or len(self.source_row_indices) != n_current:
+            self.source_row_indices = np.arange(n_current, dtype=int)
         if scope in ("all", "full", "crossfit_all"):
             self.config.optimization_scope = "all"
             self.scope_row_indices = self.source_row_indices.copy()
-            print("[优化范围] 全部客户: %d" % n_current)
+            scope_label = "概率网格固定抽样客户" if getattr(
+                self, "_probability_grid_pre_sampled", False
+            ) else "全部客户"
+            print("[优化范围] %s: %d" % (scope_label, n_current))
             return
         scope_files = {
             "test": "test_idx.npy",
@@ -298,7 +326,10 @@ class LargePrecomputedGridCalculator(OptimalCreditLimitCalculator):
             getattr(self.config, "optimization_sample_enabled", False)
         )
         sample_size = getattr(self.config, "optimization_sample_size", None)
-        if sample_enabled:
+        if sample_enabled and getattr(self, "_probability_grid_pre_sampled", False):
+            self._optimization_sample_already_applied = True
+            self._subset_aligned_rows(idx, "优化范围（复用概率网格固定抽样名单）")
+        elif sample_enabled:
             if sample_size is None or int(sample_size) <= 0:
                 raise ValueError(
                     "OPTIMIZATION_SAMPLE_ENABLED=True 时，"
@@ -370,6 +401,13 @@ class LargePrecomputedGridCalculator(OptimalCreditLimitCalculator):
         self.config.optimization_sample_size = None if sample_size is None else int(sample_size)
         self.config.optimization_sample_random_state = int(random_state)
         n_current = len(self.data_info["df_aggregated"])
+        if enabled and getattr(self, "_probability_grid_pre_sampled", False):
+            self._optimization_sample_already_applied = True
+            print(
+                "[优化抽样] 已复用概率网格生成阶段的固定名单，当前客户数: %d"
+                % n_current
+            )
+            return
         if not enabled:
             print("[优化抽样] 关闭，使用当前范围全部客户: %d" % n_current)
             return
@@ -402,6 +440,12 @@ class LargePrecomputedGridCalculator(OptimalCreditLimitCalculator):
             raise FileNotFoundError(f"未找到概率网格路径: {path}")
 
         if os.path.isdir(path):
+            metadata_path = os.path.join(path, "grid_metadata.json")
+            if os.path.isfile(metadata_path):
+                with open(metadata_path, "r", encoding="utf-8") as metadata_file:
+                    grid_metadata = json.load(metadata_file)
+            else:
+                grid_metadata = {"probability_grid_sampled": False}
             customer_id = np.load(os.path.join(path, "customer_id.npy"), allow_pickle=True)
             grid = np.load(os.path.join(path, "grid.npy"), mmap_mode="r")
             p_usage_raw = np.load(os.path.join(path, "p_usage.npy"), mmap_mode="r")
@@ -416,6 +460,7 @@ class LargePrecomputedGridCalculator(OptimalCreditLimitCalculator):
             p_usage_before_cal_raw = np.load(raw_usage_path, mmap_mode="r")
             p_default_before_cal_raw = np.load(raw_default_path, mmap_mode="r")
         elif path.lower().endswith(".npz"):
+            grid_metadata = {"probability_grid_sampled": False}
             arr = np.load(path, allow_pickle=True)
             required = {"customer_id", "grid", "p_usage", "p_default", "p_usage_raw", "p_default_raw"}
             missing = required - set(arr.files)
@@ -433,7 +478,53 @@ class LargePrecomputedGridCalculator(OptimalCreditLimitCalculator):
 
         current_ids = self.data_info["df_aggregated"]["cst_id"].astype(str).to_numpy()
         file_ids = np.asarray(customer_id).astype(str)
-        order = self._align_customer_order(file_ids, current_ids)
+        if len(np.unique(current_ids)) != len(current_ids):
+            raise ValueError("当前清洗数据的 cst_id 存在重复，无法可靠对齐概率网格。")
+        if len(np.unique(file_ids)) != len(file_ids):
+            raise ValueError("概率网格 customer_id.npy 存在重复客户。")
+
+        grid_is_sampled = bool(grid_metadata.get("probability_grid_sampled", False))
+        configured_sampled = bool(
+            getattr(self.config, "optimization_sample_enabled", False)
+        )
+        if grid_is_sampled != configured_sampled:
+            raise ValueError(
+                "概率网格抽样口径与 OPTIMIZATION_SAMPLE_ENABLED 不一致: "
+                f"grid={grid_is_sampled}, config={configured_sampled}。请使用对应目录。"
+            )
+        if grid_is_sampled:
+            saved_size = grid_metadata.get("sample_size")
+            configured_size = getattr(self.config, "optimization_sample_size", None)
+            saved_seed = int(grid_metadata.get("sample_random_state", -1))
+            configured_seed = int(
+                getattr(self.config, "optimization_sample_random_state", 42)
+            )
+            if int(saved_size) != int(configured_size) or saved_seed != configured_seed:
+                raise ValueError(
+                    "抽样概率网格的 sample_size/random_state 与当前优化配置不一致。"
+                )
+
+        if len(file_ids) < len(current_ids):
+            if not grid_is_sampled:
+                raise ValueError("概率网格客户少于清洗数据，但缺少抽样元数据。")
+            current_pos = {cid: i for i, cid in enumerate(current_ids)}
+            missing = [cid for cid in file_ids if cid not in current_pos]
+            if missing:
+                raise ValueError(f"抽样概率网格客户不在当前清洗数据中，示例: {missing[:10]}")
+            data_order = np.asarray([current_pos[cid] for cid in file_ids], dtype=int)
+            self._subset_data_rows_only(data_order, "概率网格固定抽样名单")
+            current_ids = self.data_info["df_aggregated"]["cst_id"].astype(str).to_numpy()
+            order = np.arange(len(file_ids), dtype=int)
+            self._probability_grid_pre_sampled = True
+            self.grid_metadata = grid_metadata
+        else:
+            if len(file_ids) != len(current_ids):
+                raise ValueError(
+                    f"概率网格客户数异常: grid={len(file_ids)}, data={len(current_ids)}"
+                )
+            order = self._align_customer_order(file_ids, current_ids)
+            self._probability_grid_pre_sampled = grid_is_sampled
+            self.grid_metadata = grid_metadata
 
         if np.array_equal(order, np.arange(len(order))):
             p_usage = p_usage_raw
@@ -1724,6 +1815,27 @@ def main():
         saved_ratio = {int(k): float(v) for k, v in saved_ratio.items()}
         if saved_ratio != config.group_mean_min_ratio:
             raise ValueError("Saved group_mean_min_ratio differs from current policy; rerun optimization.")
+        saved_scope = str(np.asarray(state["optimization_scope"]).reshape(-1)[0])
+        if saved_scope != config.optimization_scope:
+            raise ValueError("Saved optimization_scope differs from current scope; rerun optimization.")
+        saved_sample_enabled = bool(
+            np.asarray(state["optimization_sample_enabled"]).reshape(-1)[0]
+        )
+        saved_sample_size = int(
+            np.asarray(state["optimization_sample_size"]).reshape(-1)[0]
+        )
+        saved_sample_seed = int(
+            np.asarray(state["optimization_sample_random_state"]).reshape(-1)[0]
+        )
+        current_sample_size = -1 if config.optimization_sample_size is None else int(
+            config.optimization_sample_size
+        )
+        if (
+            saved_sample_enabled != bool(config.optimization_sample_enabled)
+            or saved_sample_size != current_sample_size
+            or saved_sample_seed != int(config.optimization_sample_random_state)
+        ):
+            raise ValueError("Saved optimization sampling configuration differs; rerun optimization.")
         calculator.data_info["base_limits"] = np.asarray(state["base_limits"], dtype=float)
         calculator.data_info["base_limits_raw"] = np.asarray(state["base_limits_raw"], dtype=float)
         calculator.credit_limits = np.asarray(state["final_limits"], dtype=float)

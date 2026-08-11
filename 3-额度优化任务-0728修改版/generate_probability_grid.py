@@ -39,6 +39,7 @@ from load_kechuang_potential_data import (
     stratified_dual_target_partition_indices,
 )
 from sampling_methods import BalanceCascade, sampler_factory, print_sampling_summary
+from optimization_sampling import build_optimization_sample_plan
 
 # ── 参数（可被 notebook *_OVERRIDE 覆盖）────────────────────────────
 CLEANED_FILE          = globals().get("CLEANED_FILE_OVERRIDE",          "data_cleaned.csv")
@@ -69,6 +70,15 @@ CROSS_FIT_MODE        = bool(globals().get("CROSS_FIT_MODE_OVERRIDE", False))
 CROSS_FIT_FOLDS       = int(globals().get("CROSS_FIT_FOLDS_OVERRIDE", 5))
 INNER_CROSS_FIT_FOLDS = int(globals().get("INNER_CROSS_FIT_FOLDS_OVERRIDE", 5))
 CROSS_FIT_DIR         = globals().get("CROSS_FIT_DIR_OVERRIDE", OUT_DIR + "_crossfit_calibrated")
+PROBABILITY_GRID_SAMPLE_ENABLED = bool(
+    globals().get("PROBABILITY_GRID_SAMPLE_ENABLED_OVERRIDE", False)
+)
+PROBABILITY_GRID_SAMPLE_SIZE = globals().get(
+    "PROBABILITY_GRID_SAMPLE_SIZE_OVERRIDE", None
+)
+PROBABILITY_GRID_SAMPLE_RANDOM_STATE = int(
+    globals().get("PROBABILITY_GRID_SAMPLE_RANDOM_STATE_OVERRIDE", RANDOM_STATE)
+)
 _LEGACY_SAMPLING_METHOD = globals().get("SAMPLING_METHOD_OVERRIDE", None)
 _LEGACY_SAMPLING_STRATEGY = globals().get("SAMPLING_STRATEGY_OVERRIDE", 1.0)
 _LEGACY_SAMPLING_N_ESTIMATORS = int(
@@ -466,6 +476,78 @@ def _predict_probability_grid(
     return np.clip(p_usage, 0.0, 1.0), np.clip(p_default, 0.0, 1.0)
 
 
+def _predict_probabilities_at_grid_indices(
+    X: pd.DataFrame,
+    booster_usage,
+    booster_default,
+    grid: np.ndarray,
+    grid_indices,
+):
+    """只在每位客户的一个指定额度点预测，用于完整校准集拟合 Isotonic。"""
+    feat_names = X.columns.tolist()
+    if QUOTA_COL not in feat_names:
+        raise ValueError(f"特征中找不到额度列 {QUOTA_COL}")
+    grid_indices = np.asarray(grid_indices, dtype=int).reshape(-1)
+    if len(grid_indices) != len(X):
+        raise ValueError("单点概率预测的客户数与额度下标数不一致")
+    X_point = X.to_numpy(dtype=np.float32)
+    X_point[:, feat_names.index(QUOTA_COL)] = grid[grid_indices]
+    usage = _predict_model(booster_usage, X_point).astype(np.float32)
+    default = _predict_model(booster_default, X_point).astype(np.float32)
+    return np.clip(usage, 0.0, 1.0), np.clip(default, 0.0, 1.0)
+
+
+def _relative_indices(source_rows, selected_source_rows):
+    """把完整客户表行号转换为抽样概率网格中的相对行号。"""
+    source_rows = np.asarray(source_rows, dtype=int).reshape(-1)
+    selected = set(np.asarray(selected_source_rows, dtype=int).reshape(-1).tolist())
+    return np.asarray(
+        [position for position, source in enumerate(source_rows) if int(source) in selected],
+        dtype=int,
+    )
+
+
+def _grid_metadata(source_customer_count: int, grid_customer_count: int, scope: str):
+    return {
+        "probability_grid_sampled": bool(PROBABILITY_GRID_SAMPLE_ENABLED),
+        "sample_size": (
+            None if PROBABILITY_GRID_SAMPLE_SIZE is None
+            else int(PROBABILITY_GRID_SAMPLE_SIZE)
+        ),
+        "sample_random_state": int(PROBABILITY_GRID_SAMPLE_RANDOM_STATE),
+        "source_customer_count": int(source_customer_count),
+        "grid_customer_count": int(grid_customer_count),
+        "grid_scope": str(scope),
+        "training_customer_scope": "full configured train/build folds",
+        "calibration_customer_scope": "full configured calibration/build rows",
+    }
+
+
+def _save_grid_lineage(
+    output_dir: str,
+    work: pd.DataFrame,
+    source_rows,
+    scope_labels,
+    metadata,
+):
+    """保存抽样概率网格的原始行号、客户ID、用途和配置。"""
+    source_rows = np.asarray(source_rows, dtype=int).reshape(-1)
+    np.save(os.path.join(output_dir, "source_row_indices.npy"), source_rows)
+    manifest = pd.DataFrame({
+        "row_index": np.arange(len(source_rows), dtype=int),
+        "source_row_index": source_rows,
+        "cst_id": work.iloc[source_rows]["cst_id"].astype(str).to_numpy(),
+        "optimization_scope": np.asarray(scope_labels, dtype=object),
+    })
+    manifest.to_csv(
+        os.path.join(output_dir, "optimization_sample_manifest.csv"),
+        index=False,
+        encoding=CSV_ENCODING,
+    )
+    with open(os.path.join(output_dir, "grid_metadata.json"), "w", encoding="utf-8") as f:
+        json.dump(metadata, f, ensure_ascii=False, indent=2)
+
+
 def _nearest_grid_indices(values, grid: np.ndarray) -> np.ndarray:
     values = pd.to_numeric(pd.Series(values), errors="coerce").fillna(0.0).to_numpy(dtype=float)
     idx = np.searchsorted(grid, values)
@@ -609,26 +691,45 @@ def _run_crossfit():
     dates, fold_id = _crossfit_stratified_folds(work)
     y_usage = work["y_freq"].astype(int).reset_index(drop=True)
     y_default = work["y_dq_risk"].astype(int).reset_index(drop=True)
-    customer_id = work["cst_id"].astype(str).to_numpy()
+    customer_id_full = work["cst_id"].astype(str).to_numpy()
     grid = _build_grid()
     os.makedirs(CROSS_FIT_DIR, exist_ok=True)
+
+    if PROBABILITY_GRID_SAMPLE_ENABLED:
+        if PROBABILITY_GRID_SAMPLE_SIZE is None or int(PROBABILITY_GRID_SAMPLE_SIZE) <= 0:
+            raise ValueError("概率网格抽样开启时 sample_size 必须为正整数")
+        sample_plan = build_optimization_sample_plan(
+            work,
+            sample_size=int(PROBABILITY_GRID_SAMPLE_SIZE),
+            random_state=PROBABILITY_GRID_SAMPLE_RANDOM_STATE,
+        )
+        output_source_idx = np.asarray(sample_plan["all"], dtype=int)
+        print(
+            "  [概率网格抽样] crossfit all: %d -> %d 客户"
+            % (len(work), len(output_source_idx))
+        )
+    else:
+        output_source_idx = np.arange(len(work), dtype=int)
+    customer_id = customer_id_full[output_source_idx]
+    source_to_output = np.full(len(work), -1, dtype=int)
+    source_to_output[output_source_idx] = np.arange(len(output_source_idx), dtype=int)
 
     # Disk-backed matrices avoid holding all-customer x all-limit grids in RAM.
     p_usage_out = open_memmap(
         os.path.join(CROSS_FIT_DIR, "p_usage.npy"), mode="w+", dtype="float32",
-        shape=(len(work), len(grid)),
+        shape=(len(output_source_idx), len(grid)),
     )
     p_default_out = open_memmap(
         os.path.join(CROSS_FIT_DIR, "p_default.npy"), mode="w+", dtype="float32",
-        shape=(len(work), len(grid)),
+        shape=(len(output_source_idx), len(grid)),
     )
     p_usage_raw_out = open_memmap(
         os.path.join(CROSS_FIT_DIR, "p_usage_raw.npy"), mode="w+", dtype="float32",
-        shape=(len(work), len(grid)),
+        shape=(len(output_source_idx), len(grid)),
     )
     p_default_raw_out = open_memmap(
         os.path.join(CROSS_FIT_DIR, "p_default_raw.npy"), mode="w+", dtype="float32",
-        shape=(len(work), len(grid)),
+        shape=(len(output_source_idx), len(grid)),
     )
     manifest_rows = []
     preprocessing_all = {}
@@ -738,13 +839,20 @@ def _run_crossfit():
             categorical_outer,
             "default",
         )
-        raw_u_pred, raw_d_pred = _predict_probability_grid(
-            X_outer.iloc[pred_idx], booster_u, booster_d, grid
+        grid_pred_idx = pred_idx[source_to_output[pred_idx] >= 0]
+        print(
+            "  [概率网格目标行] outer fold %d: %d/%d"
+            % (fold + 1, len(grid_pred_idx), len(pred_idx))
         )
-        p_usage_raw_out[pred_idx, :] = raw_u_pred
-        p_default_raw_out[pred_idx, :] = raw_d_pred
-        p_usage_out[pred_idx, :] = _calibrate_matrix(iso_u, raw_u_pred)
-        p_default_out[pred_idx, :] = _calibrate_matrix(iso_d, raw_d_pred)
+        if len(grid_pred_idx):
+            raw_u_pred, raw_d_pred = _predict_probability_grid(
+                X_outer.iloc[grid_pred_idx], booster_u, booster_d, grid
+            )
+            output_positions = source_to_output[grid_pred_idx]
+            p_usage_raw_out[output_positions, :] = raw_u_pred
+            p_default_raw_out[output_positions, :] = raw_d_pred
+            p_usage_out[output_positions, :] = _calibrate_matrix(iso_u, raw_u_pred)
+            p_default_out[output_positions, :] = _calibrate_matrix(iso_d, raw_d_pred)
         p_usage_out.flush()
         p_default_out.flush()
         p_usage_raw_out.flush()
@@ -753,18 +861,31 @@ def _run_crossfit():
             "outer_final": metadata_outer,
             "inner_crossfit": inner_metadata,
         }
-        for idx in pred_idx:
+        for idx in grid_pred_idx:
             manifest_rows.append({
-                "row_index": int(idx), "cst_id": customer_id[idx],
+                "row_index": int(source_to_output[idx]),
+                "source_row_index": int(idx),
+                "cst_id": customer_id_full[idx],
                 "fold": fold + 1, "role": "out_of_fold_prediction",
                 "split_eff_date": dates.iloc[idx],
             })
 
     np.save(os.path.join(CROSS_FIT_DIR, "customer_id.npy"), customer_id)
     np.save(os.path.join(CROSS_FIT_DIR, "grid.npy"), grid)
-    work.to_csv(os.path.join(CROSS_FIT_DIR, "work_features.csv"), index=False, encoding=CSV_ENCODING)
+    work.iloc[output_source_idx].reset_index(drop=True).to_csv(
+        os.path.join(CROSS_FIT_DIR, "work_features.csv"),
+        index=False,
+        encoding=CSV_ENCODING,
+    )
     pd.DataFrame(manifest_rows).sort_values("row_index").to_csv(
         os.path.join(CROSS_FIT_DIR, "split_manifest.csv"), index=False, encoding=CSV_ENCODING
+    )
+    _save_grid_lineage(
+        CROSS_FIT_DIR,
+        work,
+        output_source_idx,
+        np.repeat("all", len(output_source_idx)),
+        _grid_metadata(len(work), len(output_source_idx), "all"),
     )
     with open(os.path.join(CROSS_FIT_DIR, "feature_preprocessing.json"), "w", encoding="utf-8") as f:
         json.dump(preprocessing_all, f, ensure_ascii=False, indent=2)
@@ -821,72 +942,49 @@ if not CROSS_FIT_MODE:
     _save_model_bundle(booster_default, "saved_models/booster_default.txt", "default")
     print("  模型已保存到 saved_models/")
 
-    print("\n[4/5] 生成概率网格…")
+    print("\n[4/6] 固定概率网格客户名单…")
+    if PROBABILITY_GRID_SAMPLE_ENABLED:
+        if PROBABILITY_GRID_SAMPLE_SIZE is None or int(PROBABILITY_GRID_SAMPLE_SIZE) <= 0:
+            raise ValueError("概率网格抽样开启时 sample_size 必须为正整数")
+        sample_plan = build_optimization_sample_plan(
+            work,
+            sample_size=int(PROBABILITY_GRID_SAMPLE_SIZE),
+            random_state=PROBABILITY_GRID_SAMPLE_RANDOM_STATE,
+            fit_indices=fit_idx,
+            test_indices=test_idx,
+        )
+        selected_fit_source = np.asarray(sample_plan["fit"], dtype=int)
+        selected_test_source = np.asarray(sample_plan["test"], dtype=int)
+        output_source_idx = np.sort(np.unique(np.concatenate([
+            selected_fit_source, selected_test_source,
+        ]))).astype(int)
+        print(
+            "  [概率网格抽样] fit=%d/%d, test=%d/%d, dev grid union=%d"
+            % (
+                len(selected_fit_source), len(fit_idx),
+                len(selected_test_source), len(test_idx),
+                len(output_source_idx),
+            )
+        )
+    else:
+        selected_fit_source = np.asarray(fit_idx, dtype=int)
+        selected_test_source = np.asarray(test_idx, dtype=int)
+        output_source_idx = np.arange(len(work), dtype=int)
+
+    grid_train_idx = _relative_indices(output_source_idx, train_idx)
+    grid_validation_idx = _relative_indices(output_source_idx, validation_idx)
+    grid_fit_idx = _relative_indices(output_source_idx, selected_fit_source)
+    grid_cal_idx = _relative_indices(output_source_idx, cal_idx)
+    grid_test_idx = _relative_indices(output_source_idx, selected_test_source)
+    customer_id = work.iloc[output_source_idx]["cst_id"].astype(str).to_numpy()
+
+    print("\n[5/6] 使用完整校准集拟合 Isotonic，再为固定客户名单生成概率网格…")
     grid = _build_grid()
-    p_usage, p_default = _predict_probability_grid(
-        X_usage, booster_usage, booster_default, grid
-    )
-
-    print("\n[5/5] 保存 .npy 文件…")
-    os.makedirs(OUT_DIR, exist_ok=True)
-    customer_id = work["cst_id"].astype(str).to_numpy()
-
-    np.save(os.path.join(OUT_DIR, "customer_id.npy"), customer_id)
-    np.save(os.path.join(OUT_DIR, "grid.npy"),        grid)
-    np.save(os.path.join(OUT_DIR, "p_usage.npy"),      p_usage)
-    np.save(os.path.join(OUT_DIR, "p_default.npy"),    p_default)
-    np.save(os.path.join(OUT_DIR, "train_idx.npy"),    train_idx)
-    np.save(os.path.join(OUT_DIR, "validation_idx.npy"), validation_idx)
-    np.save(os.path.join(OUT_DIR, "fit_idx.npy"),      fit_idx)
-    np.save(os.path.join(OUT_DIR, "cal_idx.npy"),      cal_idx)
-    np.save(os.path.join(OUT_DIR, "test_idx.npy"),     test_idx)
-    work.to_csv(os.path.join(OUT_DIR, "work_features.csv"), index=False, encoding=CSV_ENCODING)
-
-    split_name = np.empty(len(work), dtype=object)
-    split_name[train_idx] = "train"
-    split_name[validation_idx] = "validation"
-    split_name[cal_idx] = "cal"
-    split_name[test_idx] = "test"
-    split_manifest = pd.DataFrame({
-        "row_index": np.arange(len(work), dtype=int),
-        "cst_id": customer_id,
-        "split": split_name,
-        "split_eff_date": pd.to_datetime(work["split_eff_date"], errors="coerce"),
-        "y_freq": y_usage.to_numpy(dtype=int),
-        "y_dq_risk": y_default.to_numpy(dtype=int),
-    })
-    split_manifest.to_csv(
-        os.path.join(OUT_DIR, "split_manifest.csv"),
-        index=False,
-        encoding=CSV_ENCODING,
-    )
-    with open(os.path.join(OUT_DIR, "feature_preprocessing.json"), "w", encoding="utf-8") as f:
-        json.dump(preprocessing_metadata, f, ensure_ascii=False, indent=2)
-
-    # 保存特征名供 scorecard 使用
-    with open(os.path.join(OUT_DIR, "feature_names.txt"), "w", encoding="utf-8") as f:
-        f.write("\n".join(feat_names))
-
-    print(f"\n✓ 已保存到 {OUT_DIR}/")
-    print(f"  customer_id.npy  shape={customer_id.shape}")
-    print(f"  grid.npy         shape={grid.shape}")
-    print(f"  p_usage.npy      shape={p_usage.shape}")
-    print(f"  p_default.npy    shape={p_default.shape}")
-    print(
-        "  split train/validation/cal/test: "
-        f"{len(train_idx)}/{len(validation_idx)}/{len(cal_idx)}/{len(test_idx)}"
-    )
-    print("  feature preprocessing fit scope: train_plus_validation_after_sampling_selection")
-    print(f"  y_freq 模式      : {Y_FREQ_MODE}")
-    print(f"  HANDLE_IMBALANCE : {HANDLE_IMBALANCE}")
-
-
-    print("\n[6/6] 在独立校准集上拟合 Isotonic，并保存开发阶段校准概率网格…")
     original_limits = pd.to_numeric(work[QUOTA_COL], errors="coerce").fillna(0.0).to_numpy()
     cal_grid_idx = _nearest_grid_indices(original_limits[cal_idx], grid)
-    cal_rows = np.asarray(cal_idx, dtype=int)
-    raw_usage_cal = np.asarray(p_usage[cal_rows, cal_grid_idx], dtype=float)
-    raw_default_cal = np.asarray(p_default[cal_rows, cal_grid_idx], dtype=float)
+    raw_usage_cal, raw_default_cal = _predict_probabilities_at_grid_indices(
+        X_usage.iloc[cal_idx], booster_usage, booster_default, grid, cal_grid_idx
+    )
     if y_usage.iloc[cal_idx].nunique() < 2 or y_default.iloc[cal_idx].nunique() < 2:
         raise ValueError("开发阶段校准集至少需要同时包含正负样本")
     usage_dev_calibrator = IsotonicRegression(out_of_bounds="clip").fit(
@@ -895,8 +993,74 @@ if not CROSS_FIT_MODE:
     default_dev_calibrator = IsotonicRegression(out_of_bounds="clip").fit(
         raw_default_cal, y_default.iloc[cal_idx]
     )
+    p_usage, p_default = _predict_probability_grid(
+        X_usage.iloc[output_source_idx], booster_usage, booster_default, grid
+    )
     p_usage_dev_calibrated = _calibrate_matrix(usage_dev_calibrator, p_usage)
     p_default_dev_calibrated = _calibrate_matrix(default_dev_calibrator, p_default)
+
+    split_name_full = np.empty(len(work), dtype=object)
+    split_name_full[train_idx] = "train"
+    split_name_full[validation_idx] = "validation"
+    split_name_full[cal_idx] = "cal"
+    split_name_full[test_idx] = "test"
+    split_manifest_full = pd.DataFrame({
+        "row_index": np.arange(len(work), dtype=int),
+        "cst_id": work["cst_id"].astype(str).to_numpy(),
+        "split": split_name_full,
+        "split_eff_date": pd.to_datetime(work["split_eff_date"], errors="coerce"),
+        "y_freq": y_usage.to_numpy(dtype=int),
+        "y_dq_risk": y_default.to_numpy(dtype=int),
+    })
+    split_manifest = split_manifest_full.iloc[output_source_idx].copy().reset_index(drop=True)
+    split_manifest.insert(0, "source_row_index", output_source_idx)
+    split_manifest["row_index"] = np.arange(len(split_manifest), dtype=int)
+
+    scope_labels = np.full(len(output_source_idx), "calibration_only", dtype=object)
+    scope_labels[np.isin(output_source_idx, selected_fit_source)] = "fit"
+    scope_labels[np.isin(output_source_idx, selected_test_source)] = "test"
+    metadata = _grid_metadata(len(work), len(output_source_idx), "fit_plus_test")
+
+    print("\n[6/6] 保存抽样口径、校准前后概率网格和完整开发参数样本元数据…")
+    os.makedirs(OUT_DIR, exist_ok=True)
+    np.save(os.path.join(OUT_DIR, "customer_id.npy"), customer_id)
+    np.save(os.path.join(OUT_DIR, "grid.npy"), grid)
+    np.save(os.path.join(OUT_DIR, "p_usage.npy"), p_usage)
+    np.save(os.path.join(OUT_DIR, "p_default.npy"), p_default)
+    for name, value in [
+        ("train_idx.npy", grid_train_idx),
+        ("validation_idx.npy", grid_validation_idx),
+        ("fit_idx.npy", grid_fit_idx),
+        ("cal_idx.npy", grid_cal_idx),
+        ("test_idx.npy", grid_test_idx),
+    ]:
+        np.save(os.path.join(OUT_DIR, name), value)
+    grid_work = work.iloc[output_source_idx].reset_index(drop=True)
+    grid_work.to_csv(
+        os.path.join(OUT_DIR, "work_features.csv"), index=False, encoding=CSV_ENCODING
+    )
+    work.to_csv(
+        os.path.join(OUT_DIR, "full_work_features.csv"), index=False, encoding=CSV_ENCODING
+    )
+    for name, value in [
+        ("full_train_idx.npy", train_idx),
+        ("full_validation_idx.npy", validation_idx),
+        ("full_fit_idx.npy", fit_idx),
+        ("full_cal_idx.npy", cal_idx),
+        ("full_test_idx.npy", test_idx),
+    ]:
+        np.save(os.path.join(OUT_DIR, name), np.asarray(value, dtype=int))
+    split_manifest.to_csv(
+        os.path.join(OUT_DIR, "split_manifest.csv"), index=False, encoding=CSV_ENCODING
+    )
+    split_manifest_full.to_csv(
+        os.path.join(OUT_DIR, "full_split_manifest.csv"), index=False, encoding=CSV_ENCODING
+    )
+    _save_grid_lineage(OUT_DIR, work, output_source_idx, scope_labels, metadata)
+    with open(os.path.join(OUT_DIR, "feature_preprocessing.json"), "w", encoding="utf-8") as f:
+        json.dump(preprocessing_metadata, f, ensure_ascii=False, indent=2)
+    with open(os.path.join(OUT_DIR, "feature_names.txt"), "w", encoding="utf-8") as f:
+        f.write("\n".join(feat_names))
 
     os.makedirs(DEV_CALIBRATED_DIR, exist_ok=True)
     np.save(os.path.join(DEV_CALIBRATED_DIR, "customer_id.npy"), customer_id)
@@ -905,20 +1069,44 @@ if not CROSS_FIT_MODE:
     np.save(os.path.join(DEV_CALIBRATED_DIR, "p_default.npy"), p_default_dev_calibrated)
     np.save(os.path.join(DEV_CALIBRATED_DIR, "p_usage_raw.npy"), p_usage)
     np.save(os.path.join(DEV_CALIBRATED_DIR, "p_default_raw.npy"), p_default)
-    np.save(os.path.join(DEV_CALIBRATED_DIR, "train_idx.npy"), train_idx)
-    np.save(os.path.join(DEV_CALIBRATED_DIR, "validation_idx.npy"), validation_idx)
-    np.save(os.path.join(DEV_CALIBRATED_DIR, "fit_idx.npy"), fit_idx)
-    np.save(os.path.join(DEV_CALIBRATED_DIR, "cal_idx.npy"), cal_idx)
-    np.save(os.path.join(DEV_CALIBRATED_DIR, "test_idx.npy"), test_idx)
-    work.to_csv(
+    for name, value in [
+        ("train_idx.npy", grid_train_idx),
+        ("validation_idx.npy", grid_validation_idx),
+        ("fit_idx.npy", grid_fit_idx),
+        ("cal_idx.npy", grid_cal_idx),
+        ("test_idx.npy", grid_test_idx),
+    ]:
+        np.save(os.path.join(DEV_CALIBRATED_DIR, name), value)
+    grid_work.to_csv(
         os.path.join(DEV_CALIBRATED_DIR, "work_features.csv"),
         index=False,
         encoding=CSV_ENCODING,
     )
+    work.to_csv(
+        os.path.join(DEV_CALIBRATED_DIR, "full_work_features.csv"),
+        index=False,
+        encoding=CSV_ENCODING,
+    )
+    for name, value in [
+        ("full_train_idx.npy", train_idx),
+        ("full_validation_idx.npy", validation_idx),
+        ("full_fit_idx.npy", fit_idx),
+        ("full_cal_idx.npy", cal_idx),
+        ("full_test_idx.npy", test_idx),
+    ]:
+        np.save(os.path.join(DEV_CALIBRATED_DIR, name), np.asarray(value, dtype=int))
     split_manifest.to_csv(
         os.path.join(DEV_CALIBRATED_DIR, "split_manifest.csv"),
         index=False,
         encoding=CSV_ENCODING,
+    )
+    split_manifest_full.to_csv(
+        os.path.join(DEV_CALIBRATED_DIR, "full_split_manifest.csv"),
+        index=False,
+        encoding=CSV_ENCODING,
+    )
+    _save_grid_lineage(
+        DEV_CALIBRATED_DIR, work, output_source_idx, scope_labels, metadata
     )
     with open(os.path.join(DEV_CALIBRATED_DIR, "feature_preprocessing.json"), "w", encoding="utf-8") as f:
         json.dump(preprocessing_metadata, f, ensure_ascii=False, indent=2)
@@ -936,4 +1124,8 @@ if not CROSS_FIT_MODE:
     print(
         "  模型拟合范围: train+validation；校准器拟合范围: cal；"
         "test 仅供一次性离线评价"
+    )
+    print(
+        "  概率网格客户范围: %d/%d；模型训练和校准仍使用完整配置范围"
+        % (len(output_source_idx), len(work))
     )

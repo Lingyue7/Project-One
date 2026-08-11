@@ -22,7 +22,8 @@
 | `parameter_selection.py` | 计算平均支用率与 `c1`、历史回收法 LGD、人才等级额度上限，并保存参数审计结果。 |
 | `load_kechuang_potential_data.py` | 与任务2同步的数据口径：安全重复检查、账户到客户聚合、双标签构造、缺失标签排除和训练集拟合特征处理。 |
 | `sampling_methods.py` | 与任务2同步的类别不平衡采样工具；距离型方法在训练数据内拟合 RobustScaler，混合特征按 SMOTENC 规则处理。 |
-| `generate_probability_grid.py` | 执行与任务2同步的双标签联合分层随机划分、训练支用/违约模型并生成开发阶段和全量折外校准概率网格。 |
+| `generate_probability_grid.py` | 执行与任务2同步的双标签联合分层随机划分、训练支用/违约模型；全量模式生成全部客户概率网格，抽样模式只保存固定优化客户的开发阶段/折外校准概率网格。 |
+| `optimization_sampling.py` | 在 fit/test/all 范围内按人才等级生成确定性的优化客户名单，供概率网格和MILP共同复用。 |
 | `probability_calibration.py` | Isotonic 校准、Brier Score、ECE 和校准曲线评估工具。 |
 | `portfolio_milp_optimizer.py` | 构造并求解离散 0-1 组合整数规划。 |
 | `optimal_credit_limit_precomputed_grid_large.py` | 读取概率网格，运行 `c2` 敏感性分析或正式优化，输出组合评价报告。 |
@@ -74,6 +75,12 @@ final test 一次性离线评价
 probability_grid_large_dev_calibrated/
 ```
 
+开启优化抽样后，概率网格也使用同一固定抽样名单，并写入带样本数和随机种子的独立目录，例如：
+
+```text
+probability_grid_large_sampled_n5000_rs42_dev_calibrated/
+```
+
 其中保存 `train_idx.npy`、`validation_idx.npy`、`fit_idx.npy`、`cal_idx.npy` 和 `test_idx.npy`，供后续步骤检查数据边界。
 
 全量历史客户优化使用嵌套交叉拟合生成的样本外校准概率。外层折和内部校准折同样按双标签联合分层随机划分；每个外层目标折的标签不进入对应模型或校准器。该随机划分不能替代更晚时点的 OOT 验证。目录默认是：
@@ -81,6 +88,8 @@ probability_grid_large_dev_calibrated/
 ```text
 probability_grid_large_crossfit_calibrated/
 ```
+
+抽样模式下对应目录为 `probability_grid_large_sampled_n5000_rs42_crossfit_calibrated/`。外层/内部模型仍使用完整建模折训练，只有候选额度概率矩阵的目标客户行缩减为固定的 `all` 抽样名单。
 
 ## 风险调整目标
 
@@ -234,17 +243,21 @@ R = 1.05 × Σ[历史额度_i × 校准违约概率_i(历史额度_i)]
 
 若完整网格变量数超过 `MILP_MAX_VARIABLES`，代码会保留目标较高、上下界、历史额度邻近点和均匀覆盖点等代表性候选。是否压缩、变量数、求解状态和 MIP gap 均写入 `solver_summary.csv`。
 
-### 仅抽取部分客户运行优化
+### 同步抽取概率网格与额度优化客户
 
 Notebook 配置区提供以下开关：
 
 ```python
-OPTIMIZATION_SAMPLE_ENABLED = False  # True=只抽部分客户运行额度优化
+OPTIMIZATION_SAMPLE_ENABLED = False  # True=只为固定抽样客户生成概率网格并运行优化
 OPTIMIZATION_SAMPLE_SIZE = 5000
 OPTIMIZATION_SAMPLE_RANDOM_STATE = 42
 ```
 
-抽样发生在 Cell 6B、7、8 各自的 `optimization_scope` 内，只减少进入整数规划的客户，不重新训练支用/违约模型，也不改变 Cell 6 的参数估计客户池。代码按人才等级分层抽样，并同步裁剪客户表、标签和四套校准前后概率网格；总额度预算与风险预算在未手工指定时按抽中客户重新计算。抽样结果只能用于流程调试或近似分析，正式报告应关闭开关后使用全量客户重跑。
+抽样名单在 Cell 5 生成概率网格之前一次性固定：`fit` 名单用于 Cell 6B，`test` 名单用于 Cell 7，`all` 名单用于 Cell 8。支用/违约模型训练、特征预处理规则拟合、完整校准集 Isotonic 拟合和外层交叉拟合的建模折均不缩减，只减少需要扫描候选额度并保存概率矩阵的客户行。Cell 6B、7、8读取对应名单，不再二次随机抽样；Cell 6 参数仍使用完整 `train + validation` 客户池。
+
+抽样目录会保存 `source_row_indices.npy`、`optimization_sample_manifest.csv` 和 `grid_metadata.json`，用于核验客户ID、原始行号、样本数、随机种子和适用范围。总额度预算与风险预算在未手工指定时按实际进入优化的抽样客户重新计算。抽样结果只能用于流程调试或近似分析，正式报告应关闭开关后使用全量客户重跑。
+
+抽样结果目录同样带样本标签，例如 `reports_sampled_n5000_rs42/`，不会覆盖关闭开关后生成的正式 `reports/`。
 
 ## 运行前检查
 
