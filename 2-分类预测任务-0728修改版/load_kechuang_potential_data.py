@@ -27,6 +27,7 @@
 主要流程：
   1.   read_data                        —— 读取 CSV 或 Excel
   2.   rename_kechuang_cols             —— 英文科创字段名恢复为中文
+  2.1 filter_excluded_busikind          —— 聚合前剔除产品代码0065/0246
   3.   filter_by_maturity               —— [可选] 按到期日过滤
   3.5  filter_by_eff_date               —— [可选] 按贷款生效日过滤
   3.7  filter_dq_start_customers        —— [仅 y_dq_risk] 剔除起点已违约客户
@@ -232,6 +233,28 @@ def read_data(file_path: str, csv_encoding: str = "utf-8-sig") -> pd.DataFrame:
 # ─────────────────────────────────────────────
 # Step 0.05：按 (cst_id, loanacctno) 检查重复（可选去重）
 # ─────────────────────────────────────────────
+
+
+def filter_excluded_busikind(df: pd.DataFrame) -> pd.DataFrame:
+    """聚合前剔除产品代码为 0065 / 0246 的贷款行，兼容数值和前导零格式。"""
+    if "busikind" not in df.columns:
+        print("  [产品代码筛选] 未找到 busikind 字段，跳过 0065/0246 剔除。")
+        return df
+
+    normalized = df["busikind"].map(_canonicalize_category_code)
+    excluded_codes = {"65", "246"}
+    remove_mask = normalized.isin(excluded_codes)
+    removed = int(remove_mask.sum())
+    if removed:
+        print(
+            "  [产品代码筛选] 剔除 busikind 为 0065/0246 "
+            f"（兼容 65/246 数值格式）的贷款行：{removed:,} 行；"
+            f"剩余 {len(df) - removed:,} 行"
+        )
+    else:
+        print("  [产品代码筛选] 未发现 busikind 为 0065/0246（或 65/246）的贷款行。")
+    return df.loc[~remove_mask].copy()
+
 
 def report_cst_loan_duplicates(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -1811,6 +1834,9 @@ def load_kechuang_potential(
 
     print(f"[2/7] 科创字段英文别名恢复为中文...")
     df0 = rename_kechuang_cols(df0)
+
+    print("[2.1/8] 聚合前产品代码筛选：剔除 busikind=0065/0246...")
+    df0 = filter_excluded_busikind(df0)
 
     print("[2.2/8] 字段日期覆盖统计（列名统一后、其他筛选和聚合前）...")
     field_coverage_summary_df, field_coverage_monthly_df = get_field_date_coverage(df0)
