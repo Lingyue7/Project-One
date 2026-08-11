@@ -24,12 +24,12 @@
 
 import json
 import os
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
-OPTIMIZER_STATE_VERSION = "parameter_selected_portfolio_milp_v2"
+OPTIMIZER_STATE_VERSION = "parameter_selected_portfolio_milp_v3"
 
 from load_kechuang_potential_data import (
     read_data,
@@ -94,6 +94,9 @@ class LargePrecomputedGridConfig(OptimalCreditLimitConfig):
         self.milp_time_limit_seconds = 600.0
         self.milp_relative_gap = 0.01
         self.optimization_scope = "all"
+        self.optimization_sample_enabled = False
+        self.optimization_sample_size = None
+        self.optimization_sample_random_state = 42
         self.report_dir = "reports"
 
 
@@ -169,18 +172,6 @@ class LargePrecomputedGridCalculator(OptimalCreditLimitCalculator):
             add_quota_sq=False, add_quota_cube=False, add_quota_log=False,
         )
 
-        if self.config.max_samples is not None and len(X_usage) > self.config.max_samples:
-            print(f"样本数量控制：从 {len(X_usage)} 减少到 {self.config.max_samples}")
-            np.random.seed(42)
-            sample_indices = np.random.choice(
-                len(X_usage), self.config.max_samples, replace=False
-            )
-            X_usage = X_usage.iloc[sample_indices]
-            y_usage = y_usage.iloc[sample_indices]
-            X_default = X_default.iloc[sample_indices]
-            y_default = y_default.iloc[sample_indices]
-            work = work.iloc[sample_indices].copy()
-
         self.data_info = {
             "df_raw": work,
             "df_aggregated": work,
@@ -223,12 +214,69 @@ class LargePrecomputedGridCalculator(OptimalCreditLimitCalculator):
         print("概率网格读取完成")
         return self.models
 
+    def _subset_aligned_rows(self, idx, label: str):
+        """同步裁剪客户表、特征/标签和四套概率矩阵，防止样本边界错位。"""
+        idx = np.asarray(idx, dtype=int).reshape(-1)
+        n_before = len(self.data_info["df_aggregated"])
+        if not len(idx):
+            raise ValueError(f"{label} 的客户索引为空。")
+        if np.any(idx < 0) or np.any(idx >= n_before):
+            raise IndexError(f"{label} 的客户索引超出当前样本范围 0~{n_before - 1}。")
+        if len(np.unique(idx)) != len(idx):
+            raise ValueError(f"{label} 的客户索引存在重复。")
+
+        row_keys = (
+            "df_raw", "df_aggregated", "df_cleaned",
+            "X_usage", "y_usage", "X_default", "y_default",
+        )
+        for key in row_keys:
+            value = self.data_info.get(key)
+            if value is None:
+                continue
+            if len(value) != n_before:
+                raise ValueError(
+                    f"{label} 前 data_info[{key}] 长度={len(value)}，"
+                    f"与客户数={n_before} 不一致。"
+                )
+            selected = value.iloc[idx]
+            self.data_info[key] = selected.reset_index(drop=True)
+
+        for key in ("p_usage", "p_default", "p_usage_raw", "p_default_raw"):
+            matrix = self.prob_grid.get(key)
+            if matrix is None or matrix.shape[0] != n_before:
+                actual = None if matrix is None else matrix.shape[0]
+                raise ValueError(
+                    f"{label} 前概率矩阵 {key} 客户数={actual}，期望={n_before}。"
+                )
+            self.prob_grid[key] = np.asarray(matrix[idx], dtype=np.float32)
+
+        source = getattr(self, "source_row_indices", np.arange(n_before, dtype=int))
+        if len(source) != n_before:
+            raise ValueError("source_row_indices 与当前客户数不一致。")
+        self.source_row_indices = np.asarray(source[idx], dtype=int)
+        self.scope_row_indices = self.source_row_indices.copy()
+
+        df_agg = self.data_info["df_aggregated"]
+        cred_col = "credamt" if "credamt" in df_agg.columns else "授信额度"
+        base_limits = pd.to_numeric(
+            df_agg[cred_col], errors="coerce"
+        ).fillna(0.0).to_numpy(dtype=float)
+        p_usage_base, p_default_base = self._lookup_probabilities(base_limits)
+        self.models = {
+            "y_proba_usage": p_usage_base,
+            "y_proba_default": p_default_base,
+        }
+        print(f"[{label}] 客户数: {n_before:,} -> {len(idx):,}")
+
     def apply_optimization_scope(self, scope: str):
         """将同一概率网格限定为开发拟合客户、最终测试客户或全部客户。"""
         scope = str(scope or "all").strip().lower()
+        n_current = len(self.data_info["df_aggregated"])
+        self.source_row_indices = np.arange(n_current, dtype=int)
         if scope in ("all", "full", "crossfit_all"):
             self.config.optimization_scope = "all"
-            self.scope_row_indices = np.arange(len(self.data_info["df_aggregated"]), dtype=int)
+            self.scope_row_indices = self.source_row_indices.copy()
+            print("[优化范围] 全部客户: %d" % n_current)
             return
         scope_files = {
             "test": "test_idx.npy",
@@ -246,22 +294,106 @@ class LargePrecomputedGridCalculator(OptimalCreditLimitCalculator):
         idx = np.asarray(np.load(index_path), dtype=int)
         if len(idx) == 0:
             raise ValueError("优化范围索引为空: %s" % index_path)
-        self.data_info["df_aggregated"] = (
-            self.data_info["df_aggregated"].iloc[idx].reset_index(drop=True)
+        sample_enabled = bool(
+            getattr(self.config, "optimization_sample_enabled", False)
         )
-        for key in ("p_usage", "p_default", "p_usage_raw", "p_default_raw"):
-            self.prob_grid[key] = np.asarray(self.prob_grid[key][idx], dtype=np.float32)
-        self.scope_row_indices = idx
+        sample_size = getattr(self.config, "optimization_sample_size", None)
+        if sample_enabled:
+            if sample_size is None or int(sample_size) <= 0:
+                raise ValueError(
+                    "OPTIMIZATION_SAMPLE_ENABLED=True 时，"
+                    "OPTIMIZATION_SAMPLE_SIZE 必须为正整数。"
+                )
+            if int(sample_size) < len(idx):
+                all_levels = self._extract_talent_levels()
+                relative_idx = self._stratified_sample_positions(
+                    all_levels[idx],
+                    sample_size=int(sample_size),
+                    random_state=int(getattr(
+                        self.config, "optimization_sample_random_state", 42
+                    )),
+                )
+                idx = idx[relative_idx]
+                self._optimization_sample_already_applied = True
+                self._subset_aligned_rows(idx, "优化范围+抽样")
+            else:
+                self._subset_aligned_rows(idx, "优化范围")
+        else:
+            self._subset_aligned_rows(idx, "优化范围")
         normalized_scope = "test" if scope in ("test", "final_test") else "fit"
         self.config.optimization_scope = normalized_scope
-
-        df_agg = self.data_info["df_aggregated"]
-        cred_col = "credamt" if "credamt" in df_agg.columns else "授信额度"
-        base_limits = pd.to_numeric(df_agg[cred_col], errors="coerce").fillna(0.0).to_numpy(dtype=float)
-        p_usage_base, p_default_base = self._lookup_probabilities(base_limits)
-        self.models = {"y_proba_usage": p_usage_base, "y_proba_default": p_default_base}
         scope_name = "最终测试客户" if normalized_scope == "test" else "开发拟合客户"
-        print("[优化范围] %s: %d" % (scope_name, len(idx)))
+        print("[优化范围] 当前范围: %s" % scope_name)
+
+    @staticmethod
+    def _stratified_sample_positions(strata, sample_size: int, random_state: int):
+        """按人才等级近似等比例抽样，保证样本量允许时每个现有等级至少一人。"""
+        strata = np.asarray(strata).reshape(-1)
+        sample_size = int(sample_size)
+        levels, counts = np.unique(strata, return_counts=True)
+        if sample_size < len(levels):
+            raise ValueError(
+                f"抽样数 {sample_size} 小于当前人才等级数 {len(levels)}，"
+                "无法保证每个等级至少保留一名客户。"
+            )
+        ideal = counts.astype(float) * sample_size / len(strata)
+        allocations = np.minimum(counts, np.maximum(1, np.floor(ideal).astype(int)))
+        while int(allocations.sum()) > sample_size:
+            candidates = np.flatnonzero(allocations > 1)
+            if not len(candidates):
+                raise RuntimeError("无法将人才等级抽样配额缩减到目标样本数。")
+            chosen = int(candidates[np.argmax(allocations[candidates] - ideal[candidates])])
+            allocations[chosen] -= 1
+        while int(allocations.sum()) < sample_size:
+            candidates = np.flatnonzero(allocations < counts)
+            if not len(candidates):
+                raise RuntimeError("无法将人才等级抽样配额扩充到目标样本数。")
+            chosen = int(candidates[np.argmax(ideal[candidates] - allocations[candidates])])
+            allocations[chosen] += 1
+
+        rng = np.random.RandomState(int(random_state))
+        selected = []
+        for level, allocation in zip(levels, allocations):
+            positions = np.flatnonzero(strata == level)
+            rng.shuffle(positions)
+            selected.extend(positions[:int(allocation)].tolist())
+        return np.sort(np.asarray(selected, dtype=int))
+
+    def apply_optimization_sample(
+        self,
+        enabled: bool,
+        sample_size: Optional[int],
+        random_state: int = 42,
+    ):
+        """在 optimization_scope 内按人才等级分层抽样，并同步裁剪所有输入。"""
+        self.config.optimization_sample_enabled = bool(enabled)
+        self.config.optimization_sample_size = None if sample_size is None else int(sample_size)
+        self.config.optimization_sample_random_state = int(random_state)
+        n_current = len(self.data_info["df_aggregated"])
+        if not enabled:
+            print("[优化抽样] 关闭，使用当前范围全部客户: %d" % n_current)
+            return
+        if getattr(self, "_optimization_sample_already_applied", False):
+            print("[优化抽样] 已与 optimization_scope 合并执行，当前客户数: %d" % n_current)
+            return
+        if sample_size is None or int(sample_size) <= 0:
+            raise ValueError("OPTIMIZATION_SAMPLE_ENABLED=True 时，OPTIMIZATION_SAMPLE_SIZE 必须为正整数。")
+        if int(sample_size) >= n_current:
+            print(
+                "[优化抽样] 目标样本数 %d >= 当前客户数 %d，使用全部客户。"
+                % (int(sample_size), n_current)
+            )
+            return
+        talent_levels = self._extract_talent_levels()
+        idx = self._stratified_sample_positions(
+            talent_levels,
+            sample_size=int(sample_size),
+            random_state=int(random_state),
+        )
+        self._subset_aligned_rows(idx, "优化抽样")
+        sampled_levels = self._extract_talent_levels()
+        level_counts = dict(zip(*np.unique(sampled_levels, return_counts=True)))
+        print(f"[优化抽样] random_state={int(random_state)}，等级分布={level_counts}")
 
     def load_probability_grid(self):
         """读取 .npy 目录或 .npz 概率网格，并按当前客户顺序对齐。"""
@@ -1467,6 +1599,9 @@ def main():
     _tier_min       = _g.get("TIER_MIN_LIMITS_OPT_OVERRIDE", _g.get("TIER_MIN_LIMITS", {}))
     _tier_max       = _g.get("TIER_MAX_LIMITS_OPT_OVERRIDE", _g.get("TIER_MAX_LIMITS", {}))
     _reuse_optimization = bool(_g.get("REUSE_OPTIMIZATION_OVERRIDE", _g.get("REUSE_OPTIMIZATION", False)))
+    _sample_enabled = bool(_g.get("OPTIMIZATION_SAMPLE_ENABLED_OPT_OVERRIDE", False))
+    _sample_size = _g.get("OPTIMIZATION_SAMPLE_SIZE_OPT_OVERRIDE", None)
+    _sample_random_state = int(_g.get("OPTIMIZATION_SAMPLE_RANDOM_STATE_OPT_OVERRIDE", 42))
 
     print(f"  数据文件        : {_excel_path}")
     print(f"  清洗数据文件    : {_cleaned_file}")
@@ -1480,6 +1615,14 @@ def main():
     print(f"  risk tolerance   : {_risk_tolerance}")
     print(f"  group mean ratios: {_group_mean_min_ratio}")
     print(f"  额度区间        : [{_grid_min:,.0f}, {_grid_max:,.0f}]  步长={_grid_step:.0f}")
+    print(
+        "  优化抽样        : %s"
+        % (
+            "开启，样本数=%s，random_state=%d"
+            % (_sample_size, _sample_random_state)
+            if _sample_enabled else "关闭"
+        )
+    )
 
     config = LargePrecomputedGridConfig()
     config.limit_step       = _grid_step
@@ -1505,6 +1648,9 @@ def main():
     config.risk_tolerance   = _risk_tolerance
     config.group_mean_min_ratio = {int(k): float(v) for k, v in _group_mean_min_ratio.items()}
     config.optimization_scope = _scope
+    config.optimization_sample_enabled = _sample_enabled
+    config.optimization_sample_size = None if _sample_size is None else int(_sample_size)
+    config.optimization_sample_random_state = _sample_random_state
     config.report_dir       = _reports_dir
     config.enforce_group_mean_monotonic = bool(
         _g.get("ENFORCE_GROUP_MEAN_MONOTONIC_OPT_OVERRIDE", True)
@@ -1534,6 +1680,11 @@ def main():
     print("\n步骤2：读取概率网格...")
     calculator.train_models()
     calculator.apply_optimization_scope(_scope)
+    calculator.apply_optimization_sample(
+        enabled=_sample_enabled,
+        sample_size=_sample_size,
+        random_state=_sample_random_state,
+    )
 
     print("\n步骤3：获取人才等级...")
     talent_levels = calculator._extract_talent_levels()
@@ -1630,6 +1781,15 @@ def main():
         risk_tolerance=np.asarray([calculator.config.risk_tolerance], dtype=float),
         group_mean_min_ratio=np.asarray([json.dumps(calculator.config.group_mean_min_ratio, sort_keys=True)]),
         optimization_scope=np.asarray([calculator.config.optimization_scope]),
+        optimization_sample_enabled=np.asarray([calculator.config.optimization_sample_enabled]),
+        optimization_sample_size=np.asarray([
+            -1 if calculator.config.optimization_sample_size is None
+            else calculator.config.optimization_sample_size
+        ]),
+        optimization_sample_random_state=np.asarray([
+            calculator.config.optimization_sample_random_state
+        ]),
+        source_row_indices=np.asarray(calculator.scope_row_indices, dtype=int),
         optimizer_version=np.asarray([OPTIMIZER_STATE_VERSION]),
     )
     print(f"优化诊断状态已保存到: {state_path}")

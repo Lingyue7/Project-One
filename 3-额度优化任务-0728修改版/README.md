@@ -199,6 +199,8 @@ reports/parameter_selection/c2_selection/c2_sensitivity_summary.csv
 5. D 档上限取 `max(E上限, 1.2×U0)`；
 6. 上限向下对齐到业务额度网格，并不超过 `GRID_MAX`。
 
+技术文档要求的是 `F3 ≤ F2 ≤ F1 ≤ E ≤ D`，即非递减而非严格递增，因此在历史上限、总体 P99 或 `GRID_MAX` 截顶作用下，相邻等级允许出现相同上限。代码不会额外增加技术文档之外的百分比 gap。
+
 如果数据中出现未定义的 A/B/C 等级，参数计算会直接报错并终止整个流程。代码不会删除 A/B/C 客户后继续优化其余等级，也不会让 A/B/C 在缺少专门额度上限和组均约束的情况下进入优化。必须先补充并确认 A/B/C 的政策规则，才能将这三类客户纳入正式优化。
 
 ### 组均额度约束
@@ -232,6 +234,18 @@ R = 1.05 × Σ[历史额度_i × 校准违约概率_i(历史额度_i)]
 
 若完整网格变量数超过 `MILP_MAX_VARIABLES`，代码会保留目标较高、上下界、历史额度邻近点和均匀覆盖点等代表性候选。是否压缩、变量数、求解状态和 MIP gap 均写入 `solver_summary.csv`。
 
+### 仅抽取部分客户运行优化
+
+Notebook 配置区提供以下开关：
+
+```python
+OPTIMIZATION_SAMPLE_ENABLED = False  # True=只抽部分客户运行额度优化
+OPTIMIZATION_SAMPLE_SIZE = 5000
+OPTIMIZATION_SAMPLE_RANDOM_STATE = 42
+```
+
+抽样发生在 Cell 6B、7、8 各自的 `optimization_scope` 内，只减少进入整数规划的客户，不重新训练支用/违约模型，也不改变 Cell 6 的参数估计客户池。代码按人才等级分层抽样，并同步裁剪客户表、标签和四套校准前后概率网格；总额度预算与风险预算在未手工指定时按抽中客户重新计算。抽样结果只能用于流程调试或近似分析，正式报告应关闭开关后使用全量客户重跑。
+
 ## 运行前检查
 
 至少需要确认 Notebook 配置区的以下内容：
@@ -250,6 +264,8 @@ SAMPLING_ENSEMBLE_RATIO_DEFAULT = 1.0
 LGD_HISTORY_FILE = None       # 有可靠回收明细时填写路径
 LGD_SELECTED_SCENARIO = "neutral"
 INTEREST_RATE = 0.03
+OPTIMIZATION_SAMPLE_ENABLED = False
+OPTIMIZATION_SAMPLE_SIZE = 5000
 ```
 
 数据加载与采样实现均已与任务2同步。两边使用相同原始文件、日期窗口、起点违约剔除规则和统一双标签客户池；`y_freq` 来源或 `y_dq_risk` 终点状态任一不完整，客户都会从两个任务的建模样本中排除。默认 `DEDUP_CST_LOAN=False`，只报告同一客户-贷款账号的重复与字段冲突；设为 `True` 时仅删除字段完全一致的重复账户，冲突重复会直接报错，避免任意保留第一行。
@@ -262,7 +278,7 @@ INTEREST_RATE = 0.03
 
 运行前还应检查人才等级取值。如果数据中存在 A、B 或 C，当前流程会停止，不会自动过滤这些客户并继续运行。此时应先补充 A/B/C 的最高额度及平均额度约束规则。
 
-首次运行或任何上游数据、模型、采样、网格、参数和政策发生变化时，应设置：
+首次运行或任何上游数据、模型、采样、网格、参数、等级政策或优化抽样配置发生变化时，应设置：
 
 ```python
 REUSE_PROBABILITY_GRID = False

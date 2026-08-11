@@ -450,9 +450,13 @@ class OptimalCreditLimitCalculator:
         实际档位从优到劣：A > B > C > D > E > F1 > F2 > F3，对应等级 8/7/6/5/4/3/2/1。
         与 load_kechuang_potential_data.py 中 feature_engineering_potential 的
         tier_order 编码保持一致，确保 A/B/C 档客户不会被错误归并为最低档 F3。
-        优先用 df_cleaned（含原始档位列），其次 df_aggregated，最后随机兜底。
+        优先使用当前优化范围内的 df_aggregated，其次使用同长度的 df_cleaned。
+        找不到或无法识别时直接报错，禁止随机生成等级。
         """
-        n = len(self.data_info["X_usage"])
+        current = self.data_info.get("df_aggregated")
+        if current is None:
+            raise ValueError("data_info 缺少 df_aggregated，无法提取人才等级。")
+        n = len(current)
 
         # 实际档位：F3(1) → ... → A(8)
         # 与 load_kechuang_potential_data.py 的 tier_order 完全对齐（含大小写/“级”后缀变体）。
@@ -467,28 +471,44 @@ class OptimalCreditLimitCalculator:
             "A":  8, "A级":  8, "a":  8,
         }
 
-        # 优先从 df_cleaned 取档位（最完整，含原始字段）
-        for key in ["df_cleaned", "df_aggregated"]:
+        # df_aggregated 已随 optimization_scope / 抽样同步裁剪，应作为第一来源。
+        for key in ["df_aggregated", "df_cleaned"]:
             df_agg = self.data_info.get(key)
-            if df_agg is not None and len(df_agg) == n and "档位" in df_agg.columns:
+            if df_agg is None or len(df_agg) != n:
+                continue
+            if "档位" in df_agg.columns:
                 raw = df_agg["档位"].astype(str).str.strip()
                 mapped = raw.map(level_map)
                 n_unmapped = int(mapped.isna().sum())
                 if n_unmapped > 0:
                     unmapped_vals = sorted(raw[mapped.isna()].unique().tolist())
-                    print(
-                        f"⚠️  [档位] {key} 中有 {n_unmapped} 个值未能映射到 A~F3 任一档位: "
-                        f"{unmapped_vals}，已兜底填充为 F3(1)。请检查原始数据档位字段是否有新档位或脏数据。"
+                    raise ValueError(
+                        f"[档位] {key} 中有 {n_unmapped} 个值未能映射到 A~F3 任一档位: "
+                        f"{unmapped_vals}。禁止随机或按 F3 兜底，请修复人才等级字段。"
                     )
-                result = mapped.fillna(1).astype(int).to_numpy()
+                result = mapped.astype(int).to_numpy()
                 print(f"[档位] 使用 {key} 中的档位列，等级分布(1~8 -> 人数): {dict(zip(*np.unique(result, return_counts=True)))}")
                 return result
+            if "talent_level" in df_agg.columns:
+                numeric = pd.to_numeric(df_agg["talent_level"], errors="coerce")
+                valid = (
+                    numeric.notna()
+                    & numeric.between(1, 8)
+                    & np.isclose(numeric, np.round(numeric))
+                )
+                if not valid.all():
+                    examples = df_agg.loc[~valid, "talent_level"].astype(str).unique()[:10].tolist()
+                    raise ValueError(
+                        f"[档位] {key}.talent_level 存在无法识别的等级: {examples}。"
+                    )
+                result = numeric.astype(int).to_numpy()
+                print(f"[档位] 使用 {key}.talent_level，等级分布(1~8 -> 人数): {dict(zip(*np.unique(result, return_counts=True)))}")
+                return result
 
-        # 兜底：随机生成
-        print("[档位] 未找到档位列，使用随机兜底")
-        np.random.seed(42)
-        levels = [1, 2, 3, 4, 5, 6, 7, 8]
-        return np.random.choice(levels, size=n, p=[1 / len(levels)] * len(levels)).astype(int)
+        raise ValueError(
+            "当前优化客户数据缺少可用的 档位/talent_level 字段；"
+            "请确认概率网格 work_features.csv 与清洗数据来自同一次运行。"
+        )
     
     def _extract_mtl_task_labels(self) -> np.ndarray:
         """

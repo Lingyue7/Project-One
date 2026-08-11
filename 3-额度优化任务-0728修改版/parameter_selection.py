@@ -296,7 +296,7 @@ def derive_tier_limit_policy(
     grid_step: float = 500.0,
     grid_max: Optional[float] = None,
 ):
-    """按总体P99、分档历史上限和样本量收缩计算F3~D额度上限。"""
+    """按技术文档的总体P99、历史上限收缩与E/D放缩计算F3~D上限。"""
     if talent_col not in customer_df or credit_limit_col not in customer_df:
         raise ValueError("等级上限估计缺少字段: %s" % [talent_col, credit_limit_col])
     work = customer_df[[talent_col, credit_limit_col]].copy()
@@ -305,6 +305,8 @@ def derive_tier_limit_policy(
     work = work[np.isfinite(work["credit_limit"]) & (work["credit_limit"] >= 0)].copy()
     if work.empty:
         raise ValueError("没有可用于等级额度上限估计的历史客户")
+    if float(grid_step) <= 0:
+        raise ValueError("grid_step 必须大于0")
     u0 = float(work["credit_limit"].quantile(float(overall_quantile)))
     if u0 <= 0:
         raise ValueError("历史额度P99必须大于0")
@@ -346,7 +348,7 @@ def derive_tier_limit_policy(
             "method": "max(previous_tier, %.1f*overall_p99)" % factor,
         })
 
-    # 上限落到业务额度网格；向下取整保证离散候选不超过数据推导上限。
+    # 按技术文档仅要求非递减（允许相等）；向下取整到业务额度网格。
     rounded = {}
     previous = 0.0
     for level in range(1, 6):
@@ -356,6 +358,7 @@ def derive_tier_limit_policy(
         cap = max(previous, cap, 0.0)
         rounded[level] = float(cap)
         previous = cap
+
     summary = pd.DataFrame(rows)
     summary["rounded_upper_limit"] = summary["talent_level"].map(rounded)
     min_limits = {level: 0.0 for level in range(1, 6)}
