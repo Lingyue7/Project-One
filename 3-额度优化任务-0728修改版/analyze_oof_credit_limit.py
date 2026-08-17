@@ -29,7 +29,7 @@ def _quantile_edges(values, n_bins):
     values = values[np.isfinite(values)]
     if values.size == 0:
         raise ValueError("额度字段没有有效数值")
-    edges = np.unique(np.quantile(values, np.linspace(0, 1, n_bins + 1)))
+    edges = np.unique(np.percentile(values, np.linspace(0, 100, n_bins + 1)))
     if len(edges) < 3:
         raise ValueError("额度唯一值太少，无法分箱")
     edges[0], edges[-1] = -np.inf, np.inf
@@ -225,8 +225,8 @@ def _curve_stats(matrix, tolerance, chunk_size=512):
         "step_flat_ratio": float(flat / total),
         "start_end_change_mean": float(np.mean(start_end)),
         "start_end_change_median": float(np.median(start_end)),
-        "start_end_change_p10": float(np.quantile(start_end, 0.1)),
-        "start_end_change_p90": float(np.quantile(start_end, 0.9)),
+        "start_end_change_p10": float(np.percentile(start_end, 10.0)),
+        "start_end_change_p90": float(np.percentile(start_end, 90.0)),
     }
 
 

@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-大规模最优额度计算：预计算概率网格 + 离散组合整数规划。
+大规模最优额度计算：预计算概率网格 + 可切换组合优化后端。
 
 适用规模示例：
     4万客户 × 1999个额度网格点（1000~1000000，步长500）
 
-当前主流程将候选额度对应的风险调整收益预先计算为整数规划系数，并联合
-处理总额度预算、风险预算和人才等级平均额度单调约束。旧的拉格朗日辅助
-函数仅保留给诊断代码使用。
+当前主流程将候选额度对应的风险调整收益预先计算，并联合处理总额度预算、
+风险预算和人才等级平均额度单调约束。Python 3.6 环境默认使用明确标记的
+可行解启发式算法；具备 SciPy milp 时仍可显式切换到整数规划后端。
 
 推荐概率网格文件目录格式：
     probability_grid_large/
@@ -29,7 +29,7 @@ from typing import Optional, Tuple
 import numpy as np
 import pandas as pd
 
-OPTIMIZER_STATE_VERSION = "sample_aligned_probability_grid_v4"
+OPTIMIZER_STATE_VERSION = "sample_aligned_probability_grid_v9_backend_names"
 
 from load_kechuang_potential_data import (
     read_data,
@@ -51,9 +51,12 @@ from optimal_credit_limit import (
     build_dual_labels_train_threshold,
 )
 from portfolio_milp_optimizer import (
+    build_portfolio_candidate_table,
     concentration_shares,
     distribution_summary,
     risk_adjusted_value,
+    solve_discrete_portfolio_heuristic,
+    solve_discrete_portfolio_lagrangian,
     solve_discrete_portfolio_milp,
 )
 
@@ -89,6 +92,16 @@ class LargePrecomputedGridConfig(OptimalCreditLimitConfig):
         self.risk_tolerance = 1.05
         self.enforce_group_mean_monotonic = True
         self.group_mean_min_ratio = {2: 1.0, 3: 1.0, 4: 0.8, 5: 0.8}
+        self.solver_backend = "lagrangian"
+        self.heuristic_max_rounds = 30
+        self.lagrangian_iterations = 40
+        self.lagrangian_time_limit_seconds = 60.0
+        self.lagrangian_step_size = 0.5
+        self.lagrangian_multiplier_cap = 1000.0
+        self.local_search_enabled = True
+        self.local_search_max_passes = 3
+        self.local_search_time_limit_seconds = 30.0
+        self.local_search_pair_candidate_pool = 80
         self.milp_max_variables = 400000
         self.milp_candidates_per_customer = 16
         self.milp_time_limit_seconds = 600.0
@@ -101,7 +114,7 @@ class LargePrecomputedGridConfig(OptimalCreditLimitConfig):
 
 
 class LargePrecomputedGridCalculator(OptimalCreditLimitCalculator):
-    """读取预计算概率网格并执行离散组合整数规划。"""
+    """读取预计算概率网格并执行配置的组合优化后端。"""
 
     def __init__(self, config: LargePrecomputedGridConfig):
         super().__init__(config)
@@ -1077,9 +1090,17 @@ class LargePrecomputedGridCalculator(OptimalCreditLimitCalculator):
         _, p_default = self._lookup_probabilities(L)
         return float((p_default * L).sum())
 
-    def calculate_optimal_limits(self, talent_levels):
-        """计算最优额度，并生成与原脚本兼容的结果 DataFrame。"""
-        print("计算最优信用额度（离散 0-1 组合整数规划）...")
+    def calculate_optimal_limits(
+        self,
+        talent_levels,
+        candidate_reference_quadratic_costs=None,
+        candidate_index_table=None,
+    ):
+        """计算建议额度，并生成与原脚本兼容的结果 DataFrame。"""
+        solver_backend = str(
+            getattr(self.config, "solver_backend", "lagrangian")
+        ).strip().lower()
+        print("计算建议信用额度（优化后端: %s）..." % solver_backend)
         n_customers = len(self.data_info["df_aggregated"])
         if len(talent_levels) != n_customers:
             raise ValueError(f"talent_levels长度必须与样本数一致，期望: {n_customers}, 实际: {len(talent_levels)}")
@@ -1108,7 +1129,7 @@ class LargePrecomputedGridCalculator(OptimalCreditLimitCalculator):
         )
         self.historical_weighted_default_risk = historical_weighted_risk
 
-        milp_result = solve_discrete_portfolio_milp(
+        common_solver_kwargs = dict(
             grid=self.prob_grid["grid"],
             p_usage=self.prob_grid["p_usage"],
             p_default=self.prob_grid["p_default"],
@@ -1130,13 +1151,67 @@ class LargePrecomputedGridCalculator(OptimalCreditLimitCalculator):
             candidates_per_customer=int(
                 getattr(self.config, "milp_candidates_per_customer", 16)
             ),
-            time_limit_seconds=float(
-                getattr(self.config, "milp_time_limit_seconds", 600.0)
+            candidate_reference_quadratic_costs=(
+                None
+                if candidate_reference_quadratic_costs is None
+                else tuple(float(v) for v in candidate_reference_quadratic_costs)
             ),
-            mip_relative_gap=float(getattr(self.config, "milp_relative_gap", 0.01)),
+            candidate_index_table=candidate_index_table,
         )
-        optimal_L = np.asarray(milp_result.limits, dtype=float)
-        self.milp_result = milp_result
+        if solver_backend == "heuristic":
+            optimization_result = solve_discrete_portfolio_heuristic(
+                max_rounds=int(getattr(self.config, "heuristic_max_rounds", 30)),
+                **common_solver_kwargs
+            )
+        elif solver_backend == "lagrangian":
+            optimization_result = solve_discrete_portfolio_lagrangian(
+                max_rounds=int(getattr(self.config, "heuristic_max_rounds", 30)),
+                lagrangian_iterations=int(
+                    getattr(self.config, "lagrangian_iterations", 40)
+                ),
+                lagrangian_time_limit_seconds=float(
+                    getattr(self.config, "lagrangian_time_limit_seconds", 60.0)
+                ),
+                lagrangian_step_size=float(
+                    getattr(self.config, "lagrangian_step_size", 0.5)
+                ),
+                lagrangian_multiplier_cap=float(
+                    getattr(self.config, "lagrangian_multiplier_cap", 1000.0)
+                ),
+                local_search_enabled=bool(
+                    getattr(self.config, "local_search_enabled", True)
+                ),
+                local_search_max_passes=int(
+                    getattr(self.config, "local_search_max_passes", 3)
+                ),
+                local_search_time_limit_seconds=float(
+                    getattr(self.config, "local_search_time_limit_seconds", 30.0)
+                ),
+                local_search_pair_candidate_pool=int(
+                    getattr(self.config, "local_search_pair_candidate_pool", 80)
+                ),
+                **common_solver_kwargs
+            )
+        elif solver_backend == "scipy_milp":
+            optimization_result = solve_discrete_portfolio_milp(
+                time_limit_seconds=float(
+                    getattr(self.config, "milp_time_limit_seconds", 600.0)
+                ),
+                mip_relative_gap=float(
+                    getattr(self.config, "milp_relative_gap", 0.01)
+                ),
+                **common_solver_kwargs
+            )
+        else:
+            raise ValueError(
+                "不支持的 SOLVER_BACKEND=%s；可选 lagrangian / "
+                "heuristic / scipy_milp"
+                % solver_backend
+            )
+        optimal_L = np.asarray(optimization_result.limits, dtype=float)
+        self.optimization_result = optimization_result
+        # 保留旧属性名，避免下游报告代码失效。
+        self.milp_result = optimization_result
         p_usage_opt, p_default_opt = self._lookup_probabilities(optimal_L)
         self.models["y_proba_usage"] = p_usage_opt
         self.models["y_proba_default"] = p_default_opt
@@ -1234,12 +1309,48 @@ class LargePrecomputedGridCalculator(OptimalCreditLimitCalculator):
         rows = []
         levels = np.asarray(talent_levels, dtype=int)
         upper = np.asarray([self.config.max_limit.get(int(g), np.inf) for g in levels], dtype=float)
+        df_agg = self.data_info["df_aggregated"]
+        credit_column = "credamt" if "credamt" in df_agg.columns else "授信额度"
+        base_limits = pd.to_numeric(
+            df_agg[credit_column], errors="coerce"
+        ).fillna(0.0).to_numpy(dtype=float)
+        _, _, lgd, rates = self._level_arrays(levels)
+        common_candidate_table = build_portfolio_candidate_table(
+            grid=self.prob_grid["grid"],
+            p_usage=self.prob_grid["p_usage"],
+            p_default=self.prob_grid["p_default"],
+            levels=levels,
+            min_limits=self.config.min_limit,
+            max_limits=self.config.max_limit,
+            interest_rates=rates,
+            lgd_coefficients=lgd,
+            linear_cost=float(getattr(self.config, "linear_cost", 0.0)),
+            quadratic_cost=float(candidates[0]),
+            base_limits=base_limits,
+            max_variables=int(getattr(self.config, "milp_max_variables", 400000)),
+            candidates_per_customer=int(
+                getattr(self.config, "milp_candidates_per_customer", 16)
+            ),
+            candidate_reference_quadratic_costs=candidates,
+        )
+        print(
+            "c2 公共候选集已固定: variables=%d, reduced=%s, references=%d"
+            % (
+                len(common_candidate_table["grid_index"]),
+                bool(common_candidate_table["candidate_reduced"]),
+                len(candidates),
+            )
+        )
         for c2 in candidates:
             print("\n" + "=" * 80)
             print("c2敏感性分析: %.12g" % c2)
             print("=" * 80)
             self.config.quadratic_cost = float(c2)
-            result_df = self.calculate_optimal_limits(levels)
+            result_df = self.calculate_optimal_limits(
+                levels,
+                candidate_reference_quadratic_costs=candidates,
+                candidate_index_table=common_candidate_table,
+            )
             limits = result_df["credit_limit"].to_numpy(dtype=float)
             zero_rate = float(np.mean(np.isclose(limits, 0.0)))
             upper_hit_rate = float(np.mean(np.isclose(limits, upper)))
@@ -1272,10 +1383,17 @@ class LargePrecomputedGridCalculator(OptimalCreditLimitCalculator):
                 "total_limit": float(limits.sum()),
                 "mean_limit_change": float(np.mean(change)),
                 "median_limit_change": float(np.median(change)),
-                "p05_limit_change": float(np.quantile(change, 0.05)),
-                "p95_limit_change": float(np.quantile(change, 0.95)),
+                "p05_limit_change": float(np.percentile(change, 5.0)),
+                "p95_limit_change": float(np.percentile(change, 95.0)),
                 "business_acceptable": acceptable,
                 "rejection_reasons": ",".join(reasons),
+                "optimizer_variable_count": int(
+                    self.optimization_result.variable_count
+                ),
+                "candidate_reduced": bool(
+                    self.optimization_result.candidate_reduced
+                ),
+                "common_candidate_reference_count": len(candidates),
             })
 
         summary = pd.DataFrame(rows).sort_values("c2").reset_index(drop=True)
@@ -1303,7 +1421,11 @@ class LargePrecomputedGridCalculator(OptimalCreditLimitCalculator):
         )
         self.config.quadratic_cost = selected_c2
         print("\n✓ 已选择 c2=%.12g；在开发客户上重新生成最终参数选择解" % selected_c2)
-        selected_df = self.calculate_optimal_limits(levels)
+        selected_df = self.calculate_optimal_limits(
+            levels,
+            candidate_reference_quadratic_costs=candidates,
+            candidate_index_table=common_candidate_table,
+        )
         self.c2_sensitivity_summary = summary
         self.selected_quadratic_cost = selected_c2
         return selected_c2, summary, selected_df
@@ -1435,11 +1557,26 @@ class LargePrecomputedGridCalculator(OptimalCreditLimitCalculator):
 
         result = self.milp_result
         pd.DataFrame([{
-            "solver": "scipy.optimize.milp (HiGHS)",
+            "solver": result.solver_backend,
             "status": result.solver_status,
             "success": result.solver_success,
             "message": result.solver_message,
             "mip_gap": result.mip_gap,
+            "global_optimality_proven": bool(
+                result.solver_backend == "scipy_milp"
+                and np.isfinite(result.mip_gap)
+                and result.mip_gap <= 1e-9
+            ),
+            "constraint_feasible": result.constraint_feasible,
+            "max_normalized_constraint_violation": result.max_constraint_violation,
+            "iterations_or_nodes": result.iterations,
+            "dual_upper_bound_reduced_candidates": result.dual_upper_bound,
+            "heuristic_dual_bound_gap_reduced_candidates": result.heuristic_dual_bound_gap,
+            "feasible_start_count": result.feasible_start_count,
+            "local_search_passes": result.local_search_passes,
+            "local_search_single_moves": result.local_search_single_moves,
+            "local_search_pair_exchanges": result.local_search_pair_exchanges,
+            "local_search_objective_gain": result.local_search_objective_gain,
             "selected_variable_count": result.variable_count,
             "full_feasible_candidate_count": result.feasible_candidate_count,
             "candidate_reduced": result.candidate_reduced,
@@ -1451,6 +1588,12 @@ class LargePrecomputedGridCalculator(OptimalCreditLimitCalculator):
             f.write("本报告为模型内离线评价。历史数据没有建议额度下的反事实结果，\n")
             f.write("因此 objective_change 仅表示当前概率模型、目标函数与约束下的模型目标变化，\n")
             f.write("不能直接解释为实际利润提升。若历史额度违反新增人才政策约束，历史方案不属于同一可行域。\n")
+            if result.solver_backend in ("heuristic", "lagrangian"):
+                f.write("本次使用 Python 3.6 近似算法；结果已通过硬约束审计，但不保证全局最优，\n")
+                f.write("也不存在可报告的 MIP gap。不得将该结果表述为整数规划最优解。\n")
+            if result.solver_backend == "lagrangian":
+                f.write("heuristic_dual_bound_gap 仅针对压缩后的候选集合，不是完整网格最优性差距。\n")
+                f.write("拉格朗日双起点后运行限时双向局部搜索，允许单客户回退及两客户交换。\n")
         print("离线评价报告已保存到:", report_dir)
         return tier_summary
 
@@ -1525,8 +1668,8 @@ def _scorecard_all(df_results, calculator, tl, tier_labels,
             return c[:, :-1].astype(np.float32)
 
     sv_u = _shap(bu, X_feat); sv_d = _shap(bd, X_feat)
-    q_u = np.quantile(p_u, [.10,.25,.50,.75,.90])
-    q_d = np.quantile(p_d, [.10,.25,.50,.75,.90])
+    q_u = np.percentile(p_u, [10, 25, 50, 75, 90])
+    q_d = np.percentile(p_d, [10, 25, 50, 75, 90])
     qlbls = ["P10以下","P10-P25","P25-P50","P50-P75","P75-P90","P90以上"]
     def _ql(prob, q):
         for i, t in enumerate(list(q)+[1.1]):
@@ -1657,7 +1800,7 @@ def main():
     直接 python 运行时默认值同样生效。
     """
     print("=" * 80)
-    print("最优额度计算：校准概率网格 + 离散组合整数规划")
+    print("建议额度计算：校准概率网格 + 可切换组合优化后端")
     print("=" * 80)
 
     # ── 从 notebook Cell 1 读取覆盖参数（%run 时全局变量已注入）──────────
@@ -1693,6 +1836,41 @@ def main():
     _sample_enabled = bool(_g.get("OPTIMIZATION_SAMPLE_ENABLED_OPT_OVERRIDE", False))
     _sample_size = _g.get("OPTIMIZATION_SAMPLE_SIZE_OPT_OVERRIDE", None)
     _sample_random_state = int(_g.get("OPTIMIZATION_SAMPLE_RANDOM_STATE_OPT_OVERRIDE", 42))
+    _solver_backend = str(_g.get(
+        "SOLVER_BACKEND_OPT_OVERRIDE", _g.get("SOLVER_BACKEND", "lagrangian")
+    )).strip().lower()
+    _heuristic_max_rounds = int(_g.get(
+        "HEURISTIC_MAX_ROUNDS_OPT_OVERRIDE", _g.get("HEURISTIC_MAX_ROUNDS", 30)
+    ))
+    _lagrangian_iterations = int(_g.get(
+        "LAGRANGIAN_ITERATIONS_OPT_OVERRIDE", _g.get("LAGRANGIAN_ITERATIONS", 40)
+    ))
+    _lagrangian_time_limit_seconds = float(_g.get(
+        "LAGRANGIAN_TIME_LIMIT_SECONDS_OPT_OVERRIDE",
+        _g.get("LAGRANGIAN_TIME_LIMIT_SECONDS", 60.0),
+    ))
+    _lagrangian_step_size = float(_g.get(
+        "LAGRANGIAN_STEP_SIZE_OPT_OVERRIDE", _g.get("LAGRANGIAN_STEP_SIZE", 0.5)
+    ))
+    _lagrangian_multiplier_cap = float(_g.get(
+        "LAGRANGIAN_MULTIPLIER_CAP_OPT_OVERRIDE",
+        _g.get("LAGRANGIAN_MULTIPLIER_CAP", 1000.0),
+    ))
+    _local_search_enabled = bool(_g.get(
+        "LOCAL_SEARCH_ENABLED_OPT_OVERRIDE", _g.get("LOCAL_SEARCH_ENABLED", True)
+    ))
+    _local_search_max_passes = int(_g.get(
+        "LOCAL_SEARCH_MAX_PASSES_OPT_OVERRIDE",
+        _g.get("LOCAL_SEARCH_MAX_PASSES", 3),
+    ))
+    _local_search_time_limit_seconds = float(_g.get(
+        "LOCAL_SEARCH_TIME_LIMIT_SECONDS_OPT_OVERRIDE",
+        _g.get("LOCAL_SEARCH_TIME_LIMIT_SECONDS", 30.0),
+    ))
+    _local_search_pair_candidate_pool = int(_g.get(
+        "LOCAL_SEARCH_PAIR_CANDIDATE_POOL_OPT_OVERRIDE",
+        _g.get("LOCAL_SEARCH_PAIR_CANDIDATE_POOL", 80),
+    ))
 
     print(f"  数据文件        : {_excel_path}")
     print(f"  清洗数据文件    : {_cleaned_file}")
@@ -1705,6 +1883,21 @@ def main():
     print(f"  optimization scope: {_scope}")
     print(f"  risk tolerance   : {_risk_tolerance}")
     print(f"  group mean ratios: {_group_mean_min_ratio}")
+    print(f"  solver backend    : {_solver_backend}")
+    if _solver_backend == "lagrangian":
+        print(
+            "  lagrangian limits : iterations=%d, time_limit=%.1fs"
+            % (_lagrangian_iterations, _lagrangian_time_limit_seconds)
+        )
+        print(
+            "  local search      : enabled=%s, passes=%d, time_limit=%.1fs, pair_pool=%d"
+            % (
+                _local_search_enabled,
+                _local_search_max_passes,
+                _local_search_time_limit_seconds,
+                _local_search_pair_candidate_pool,
+            )
+        )
     print(f"  额度区间        : [{_grid_min:,.0f}, {_grid_max:,.0f}]  步长={_grid_step:.0f}")
     print(
         "  优化抽样        : %s"
@@ -1746,9 +1939,25 @@ def main():
     config.enforce_group_mean_monotonic = bool(
         _g.get("ENFORCE_GROUP_MEAN_MONOTONIC_OPT_OVERRIDE", True)
     )
-    config.milp_max_variables = int(_g.get("MILP_MAX_VARIABLES_OPT_OVERRIDE", 400000))
+    config.solver_backend = _solver_backend
+    config.heuristic_max_rounds = _heuristic_max_rounds
+    config.lagrangian_iterations = _lagrangian_iterations
+    config.lagrangian_time_limit_seconds = _lagrangian_time_limit_seconds
+    config.lagrangian_step_size = _lagrangian_step_size
+    config.lagrangian_multiplier_cap = _lagrangian_multiplier_cap
+    config.local_search_enabled = _local_search_enabled
+    config.local_search_max_passes = _local_search_max_passes
+    config.local_search_time_limit_seconds = _local_search_time_limit_seconds
+    config.local_search_pair_candidate_pool = _local_search_pair_candidate_pool
+    config.milp_max_variables = int(_g.get(
+        "OPTIMIZER_MAX_VARIABLES_OPT_OVERRIDE",
+        _g.get("MILP_MAX_VARIABLES_OPT_OVERRIDE", 400000),
+    ))
     config.milp_candidates_per_customer = int(
-        _g.get("MILP_CANDIDATES_PER_CUSTOMER_OPT_OVERRIDE", 16)
+        _g.get(
+            "OPTIMIZER_CANDIDATES_PER_CUSTOMER_OPT_OVERRIDE",
+            _g.get("MILP_CANDIDATES_PER_CUSTOMER_OPT_OVERRIDE", 16),
+        )
     )
     config.milp_time_limit_seconds = float(
         _g.get("MILP_TIME_LIMIT_SECONDS_OPT_OVERRIDE", 600.0)
@@ -1818,6 +2027,28 @@ def main():
         saved_scope = str(np.asarray(state["optimization_scope"]).reshape(-1)[0])
         if saved_scope != config.optimization_scope:
             raise ValueError("Saved optimization_scope differs from current scope; rerun optimization.")
+        saved_backend = str(np.asarray(state["solver_backend"]).reshape(-1)[0])
+        if saved_backend != config.solver_backend:
+            raise ValueError("Saved solver_backend differs from current backend; rerun optimization.")
+        for key, current in [
+            ("optimizer_max_variables", config.milp_max_variables),
+            ("optimizer_candidates_per_customer", config.milp_candidates_per_customer),
+            ("heuristic_max_rounds", config.heuristic_max_rounds),
+            ("lagrangian_iterations", config.lagrangian_iterations),
+            ("lagrangian_time_limit_seconds", config.lagrangian_time_limit_seconds),
+            ("lagrangian_step_size", config.lagrangian_step_size),
+            ("lagrangian_multiplier_cap", config.lagrangian_multiplier_cap),
+            ("local_search_enabled", config.local_search_enabled),
+            ("local_search_max_passes", config.local_search_max_passes),
+            ("local_search_time_limit_seconds", config.local_search_time_limit_seconds),
+            ("local_search_pair_candidate_pool", config.local_search_pair_candidate_pool),
+        ]:
+            saved = float(np.asarray(state[key]).reshape(-1)[0])
+            if not np.isclose(saved, float(current)):
+                raise ValueError(
+                    "Saved %s=%s differs from current %s; rerun optimization."
+                    % (key, saved, current)
+                )
         saved_sample_enabled = bool(
             np.asarray(state["optimization_sample_enabled"]).reshape(-1)[0]
         )
@@ -1855,7 +2086,7 @@ def main():
         print("✓ 已复用优化结果并恢复诊断状态:", state_path)
         return calculator, np.asarray(talent_levels), df_results
 
-    print("\n步骤4：计算最优额度...")
+    print("\n步骤4：计算建议额度...")
     if _c2_selection_mode:
         selected_c2, c2_sensitivity_summary, df_results = calculator.select_quadratic_cost(
             talent_levels=talent_levels,
@@ -1893,6 +2124,30 @@ def main():
         risk_tolerance=np.asarray([calculator.config.risk_tolerance], dtype=float),
         group_mean_min_ratio=np.asarray([json.dumps(calculator.config.group_mean_min_ratio, sort_keys=True)]),
         optimization_scope=np.asarray([calculator.config.optimization_scope]),
+        solver_backend=np.asarray([calculator.config.solver_backend]),
+        optimizer_max_variables=np.asarray([calculator.config.milp_max_variables]),
+        optimizer_candidates_per_customer=np.asarray([
+            calculator.config.milp_candidates_per_customer
+        ]),
+        heuristic_max_rounds=np.asarray([calculator.config.heuristic_max_rounds]),
+        lagrangian_iterations=np.asarray([calculator.config.lagrangian_iterations]),
+        lagrangian_time_limit_seconds=np.asarray([
+            calculator.config.lagrangian_time_limit_seconds
+        ]),
+        lagrangian_step_size=np.asarray([calculator.config.lagrangian_step_size]),
+        lagrangian_multiplier_cap=np.asarray([
+            calculator.config.lagrangian_multiplier_cap
+        ]),
+        local_search_enabled=np.asarray([calculator.config.local_search_enabled]),
+        local_search_max_passes=np.asarray([
+            calculator.config.local_search_max_passes
+        ]),
+        local_search_time_limit_seconds=np.asarray([
+            calculator.config.local_search_time_limit_seconds
+        ]),
+        local_search_pair_candidate_pool=np.asarray([
+            calculator.config.local_search_pair_candidate_pool
+        ]),
         optimization_sample_enabled=np.asarray([calculator.config.optimization_sample_enabled]),
         optimization_sample_size=np.asarray([
             -1 if calculator.config.optimization_sample_size is None

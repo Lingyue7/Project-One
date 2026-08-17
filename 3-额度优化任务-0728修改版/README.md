@@ -23,9 +23,9 @@
 | `load_kechuang_potential_data.py` | 与任务2同步的数据口径：安全重复检查、账户到客户聚合、双标签构造、缺失标签排除和训练集拟合特征处理。 |
 | `sampling_methods.py` | 与任务2同步的类别不平衡采样工具；距离型方法在训练数据内拟合 RobustScaler，混合特征按 SMOTENC 规则处理。 |
 | `generate_probability_grid.py` | 执行与任务2同步的双标签联合分层随机划分、训练支用/违约模型；全量模式生成全部客户概率网格，抽样模式只保存固定优化客户的开发阶段/折外校准概率网格。 |
-| `optimization_sampling.py` | 在 fit/test/all 范围内按人才等级生成确定性的优化客户名单，供概率网格和MILP共同复用。 |
+| `optimization_sampling.py` | 在 fit/test/all 范围内按人才等级生成确定性的优化客户名单，供概率网格和组合优化共同复用。 |
 | `probability_calibration.py` | Isotonic 校准、Brier Score、ECE 和校准曲线评估工具。 |
-| `portfolio_milp_optimizer.py` | 构造并求解离散 0-1 组合整数规划。 |
+| `portfolio_milp_optimizer.py` | 提供 SciPy MILP 后端及兼容 Python 3.6 的近似可行解后端，并统一审计硬约束。 |
 | `optimal_credit_limit_precomputed_grid_large.py` | 读取概率网格，运行 `c2` 敏感性分析或正式优化，输出组合评价报告。 |
 | `analyze_oof_credit_limit.py` | 生成折外概率分箱、ALE、概率曲线和组合约束诊断。 |
 | `viz_credit_limit.py` | 生成额度、概率、等级、风险和目标函数图表。 |
@@ -174,6 +174,8 @@ Notebook 会在开发拟合集上分别运行四次组合优化，并比较：
 - 风险预算使用率；
 - 总额度、平均/中位数及 5%/95% 分位额度调整。
 
+如果完整额度网格超过变量上限，Cell 6B 会同时参考全部 `C2_CANDIDATES` 对每位客户构造一份公共压缩候选集，再让每个 `c2` 在完全相同的客户和候选额度上求解。这样可避免把“候选集变了”误当成 `c2` 效果。敏感性表中的 `optimizer_variable_count`、`candidate_reduced` 和 `common_candidate_reference_count` 用于核对该口径。
+
 如业务已给出不可接受阈值，可填写：
 
 ```python
@@ -239,9 +241,30 @@ R = 1.05 × Σ[历史额度_i × 校准违约概率_i(历史额度_i)]
 
 ## 求解方法
 
-每名客户必须从其人才等级允许的离散额度网格中选择一个额度。候选额度的支用概率、违约概率、风险和目标系数均在求解前计算，随后由 `scipy.optimize.milp` 的 HiGHS 求解器执行一次联合 0-1 整数规划。
+每名客户必须从其人才等级允许的离散额度网格中选择一个额度。当前内部环境为 Python 3.6 / SciPy 1.1，且没有可用整数规划求解器，因此 Notebook 默认配置为：
 
-若完整网格变量数超过 `MILP_MAX_VARIABLES`，代码会保留目标较高、上下界、历史额度邻近点和均匀覆盖点等代表性候选。是否压缩、变量数、求解状态和 MIP gap 均写入 `solver_summary.csv`。
+```python
+SOLVER_BACKEND = "lagrangian"
+OPTIMIZER_MAX_VARIABLES = 400_000
+OPTIMIZER_CANDIDATES_PER_CUSTOMER = 16
+HEURISTIC_MAX_ROUNDS = 30
+LAGRANGIAN_ITERATIONS = 40
+LAGRANGIAN_TIME_LIMIT_SECONDS = 60.0
+LOCAL_SEARCH_ENABLED = True
+LOCAL_SEARCH_MAX_PASSES = 3
+LOCAL_SEARCH_TIME_LIMIT_SECONDS = 30.0
+LOCAL_SEARCH_PAIR_CANDIDATE_POOL = 80
+```
+
+`lagrangian` 先运行原 `heuristic` 贪心作为保底，再用向量化拉格朗日乘子同时为总预算、风险预算和等级均值约束定价，并额外构造一组允许“约束铺路移动”的可行解；最终自动选择目标函数更高的一组。选中的起点随后进入限时双向局部搜索：先尝试单客户升额或降额，再尝试两客户联合交换，因此可以退出“需先给某客户降额才能给另一客户升额”的贪心局部解。
+
+拉格朗日循环和局部搜索各有独立时限。若速度优先，可先设 `LOCAL_SEARCH_ENABLED=False`，或降低 `LOCAL_SEARCH_PAIR_CANDIDATE_POOL` / `LOCAL_SEARCH_MAX_PASSES`；仍需加速时再降低 `LAGRANGIAN_ITERATIONS`。将 `SOLVER_BACKEND="heuristic"` 可直接恢复原快速贪心入口，该入口不会运行拉格朗日或局部搜索。
+
+两个 Python 3.6 后端的每次升档都检查个人额度区间、总额度预算、额度加权违约风险预算和相邻等级平均额度约束，最终执行统一硬约束审计。它们返回的是近似可行解，不保证全局最优，也不存在 MIP gap；报告中不得称为“整数规划最优解”。拉格朗日后端额外报告压缩候选集合上的对偶上界及 `heuristic_dual_bound_gap_reduced_candidates`，该值不是完整额度网格的最优性差距。
+
+若未来环境具备 Python ≥ 3.8、SciPy ≥ 1.9，可将 `SOLVER_BACKEND` 显式改为 `"scipy_milp"`，恢复 HiGHS 0-1 整数规划路径。
+
+若完整网格变量数超过 `OPTIMIZER_MAX_VARIABLES`，所有后端都会保留目标较高、上下界、历史额度邻近点和均匀覆盖点等代表性候选。局部搜索也只在这个压缩后的候选集内移动。`solver_summary.csv` 会记录后端、候选压缩、约束可行性、最大标准化约束残差、局部搜索轮数/交换数及目标改善值；只有 `scipy_milp` 后端才可能报告 MIP gap。
 
 ### 同步抽取概率网格与额度优化客户
 
@@ -277,6 +300,7 @@ SAMPLING_ENSEMBLE_RATIO_DEFAULT = 1.0
 LGD_HISTORY_FILE = None       # 有可靠回收明细时填写路径
 LGD_SELECTED_SCENARIO = "neutral"
 INTEREST_RATE = 0.03
+SOLVER_BACKEND = "lagrangian"  # 速度优先可切回 heuristic
 OPTIMIZATION_SAMPLE_ENABLED = False
 OPTIMIZATION_SAMPLE_SIZE = 5000
 ```
@@ -298,11 +322,13 @@ REUSE_PROBABILITY_GRID = False
 REUSE_OPTIMIZATION = False
 ```
 
-安装依赖：
+外部可安装环境的依赖示例：
 
 ```bash
 pip install numpy pandas scipy scikit-learn lightgbm matplotlib seaborn openpyxl jupyter
 ```
+
+内部 Python 3.6 环境不需要为了 `lagrangian` 或 `heuristic` 额外安装 MILP 包；但仍需已有的 NumPy、Pandas、scikit-learn、LightGBM、OpenPyXL 和 Jupyter。两个后端都不调用 `scipy.optimize.milp`。
 
 运行：
 

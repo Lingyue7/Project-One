@@ -396,7 +396,7 @@ class OptimalCreditLimitCalculator:
         cdf = np.arange(1, len(sorted_vals) + 1) / len(sorted_vals)
         ax.plot(sorted_vals, cdf, color="steelblue", linewidth=2)
         for pct in [0.25, 0.50, 0.75, 0.90]:
-            v = np.quantile(sorted_vals, pct)
+            v = np.percentile(sorted_vals, 100.0 * pct)
             ax.axvline(v, linestyle=":", color="gray", linewidth=1)
             ax.text(v, pct - 0.04, f"P{int(pct*100)}={v:,.0f}", fontsize=9, ha="center")
         ax.set_title("Credit Limit Cumulative Distribution (CDF)")

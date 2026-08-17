@@ -4,7 +4,6 @@
 
 import json
 import os
-from dataclasses import asdict, dataclass
 from typing import Dict, Iterable, Optional, Sequence, Tuple
 
 import numpy as np
@@ -21,22 +20,43 @@ TIER_TO_LEVEL = {
 LEVEL_TO_TIER = {1: "F3", 2: "F2", 3: "F1", 4: "E", 5: "D"}
 
 
-@dataclass
-class ParameterSelectionResult:
-    interest_rate: float
-    lgd_coefficient: float
-    lgd_source: str
-    average_utilization: float
-    ftp_rate: float
-    linear_cost: float
-    c2_reference_limit: float
-    c2_deltas: Tuple[float, ...]
-    c2_candidates: Tuple[float, ...]
-    tier_min_limits: Dict[int, float]
-    tier_max_limits: Dict[int, float]
-    group_mean_min_ratio: Dict[int, float]
-    risk_tolerance: float
-    development_customer_count: int
+class ParameterSelectionResult(object):
+    """参数选择结果；使用普通类以兼容无 dataclasses 的 Python 3.6。"""
+
+    def __init__(
+        self,
+        interest_rate,
+        lgd_coefficient,
+        lgd_source,
+        average_utilization,
+        ftp_rate,
+        linear_cost,
+        c2_reference_limit,
+        c2_deltas,
+        c2_candidates,
+        tier_min_limits,
+        tier_max_limits,
+        group_mean_min_ratio,
+        risk_tolerance,
+        development_customer_count,
+    ):
+        self.interest_rate = float(interest_rate)
+        self.lgd_coefficient = float(lgd_coefficient)
+        self.lgd_source = str(lgd_source)
+        self.average_utilization = float(average_utilization)
+        self.ftp_rate = float(ftp_rate)
+        self.linear_cost = float(linear_cost)
+        self.c2_reference_limit = float(c2_reference_limit)
+        self.c2_deltas = tuple(c2_deltas)
+        self.c2_candidates = tuple(c2_candidates)
+        self.tier_min_limits = dict(tier_min_limits)
+        self.tier_max_limits = dict(tier_max_limits)
+        self.group_mean_min_ratio = dict(group_mean_min_ratio)
+        self.risk_tolerance = float(risk_tolerance)
+        self.development_customer_count = int(development_customer_count)
+
+    def to_dict(self):
+        return dict(self.__dict__)
 
 
 def read_table(path: str, encoding: str = "utf-8-sig") -> pd.DataFrame:
@@ -385,7 +405,7 @@ def save_parameter_selection(
     tier_summary: pd.DataFrame,
 ):
     os.makedirs(output_dir, exist_ok=True)
-    payload = asdict(result)
+    payload = result.to_dict()
     payload["tier_min_limits"] = {str(k): v for k, v in result.tier_min_limits.items()}
     payload["tier_max_limits"] = {str(k): v for k, v in result.tier_max_limits.items()}
     payload["group_mean_min_ratio"] = {str(k): v for k, v in result.group_mean_min_ratio.items()}
