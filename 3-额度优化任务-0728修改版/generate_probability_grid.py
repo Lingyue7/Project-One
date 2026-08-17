@@ -557,6 +557,22 @@ def _nearest_grid_indices(values, grid: np.ndarray) -> np.ndarray:
     return np.where(use_left, left, idx).astype(int)
 
 
+def _fit_isotonic_compat(raw_probability, target, label):
+    """Fit Isotonic with matching dtypes for older scikit-learn/Cython builds."""
+    x = np.ascontiguousarray(np.asarray(raw_probability, dtype=np.float64).reshape(-1))
+    y = np.ascontiguousarray(np.asarray(target, dtype=np.float64).reshape(-1))
+    if x.shape[0] != y.shape[0]:
+        raise ValueError(
+            "%s Isotonic 输入长度不一致: probability=%d, target=%d"
+            % (label, x.shape[0], y.shape[0])
+        )
+    if not np.isfinite(x).all() or not np.isfinite(y).all():
+        raise ValueError("%s Isotonic 输入包含 NaN/Inf" % label)
+    if np.unique(y).size < 2:
+        raise ValueError("%s Isotonic 标签至少需要同时包含正负样本" % label)
+    return IsotonicRegression(out_of_bounds="clip").fit(x, y)
+
+
 def _calibrate_matrix(calibrator, matrix, chunk_size=1000000):
     flat = np.asarray(matrix).reshape(-1)
     out = np.empty(flat.shape, dtype=np.float32)
@@ -801,11 +817,13 @@ def _run_crossfit():
             raise RuntimeError("outer fold %d 内部折外概率未完整覆盖 build 数据" % (fold + 1))
         if y_usage.iloc[build_idx].nunique() < 2 or y_default.iloc[build_idx].nunique() < 2:
             raise ValueError("outer fold %d 建模数据标签只有一个类别，无法校准" % (fold + 1))
-        iso_u = IsotonicRegression(out_of_bounds="clip").fit(
-            raw_u_inner[build_idx], y_usage.iloc[build_idx]
+        iso_u = _fit_isotonic_compat(
+            raw_u_inner[build_idx], y_usage.iloc[build_idx],
+            "outer fold %d usage" % (fold + 1),
         )
-        iso_d = IsotonicRegression(out_of_bounds="clip").fit(
-            raw_d_inner[build_idx], y_default.iloc[build_idx]
+        iso_d = _fit_isotonic_compat(
+            raw_d_inner[build_idx], y_default.iloc[build_idx],
+            "outer fold %d default" % (fold + 1),
         )
 
         # 校准器固定后，在全部外层建模数据上训练最终外层模型，再为目标折生成网格。
@@ -987,11 +1005,11 @@ if not CROSS_FIT_MODE:
     )
     if y_usage.iloc[cal_idx].nunique() < 2 or y_default.iloc[cal_idx].nunique() < 2:
         raise ValueError("开发阶段校准集至少需要同时包含正负样本")
-    usage_dev_calibrator = IsotonicRegression(out_of_bounds="clip").fit(
-        raw_usage_cal, y_usage.iloc[cal_idx]
+    usage_dev_calibrator = _fit_isotonic_compat(
+        raw_usage_cal, y_usage.iloc[cal_idx], "development usage"
     )
-    default_dev_calibrator = IsotonicRegression(out_of_bounds="clip").fit(
-        raw_default_cal, y_default.iloc[cal_idx]
+    default_dev_calibrator = _fit_isotonic_compat(
+        raw_default_cal, y_default.iloc[cal_idx], "development default"
     )
     p_usage, p_default = _predict_probability_grid(
         X_usage.iloc[output_source_idx], booster_usage, booster_default, grid

@@ -6,7 +6,6 @@
 需要生成候选额度概率网格并进入后续组合优化。
 """
 
-from __future__ import annotations
 
 from typing import Dict, Iterable
 
