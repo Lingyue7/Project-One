@@ -29,7 +29,7 @@ from typing import Optional, Tuple
 import numpy as np
 import pandas as pd
 
-OPTIMIZER_STATE_VERSION = "sample_aligned_probability_grid_v9_backend_names"
+OPTIMIZER_STATE_VERSION = "customer_and_tier_combined_lower_bound_v13"
 
 from load_kechuang_potential_data import (
     read_data,
@@ -111,6 +111,13 @@ class LargePrecomputedGridConfig(OptimalCreditLimitConfig):
         self.optimization_sample_size = None
         self.optimization_sample_random_state = 42
         self.report_dir = "reports"
+        self.utilization_lookup_file = "utilization_customer_lookup.csv"
+        self.utilization_column = "utilization_used"
+        self.gross_interest_rate = 0.03
+        self.ftp_rate = 0.02
+        self.linear_cost_mode = "manual"
+        self.customer_min_limit_enabled = True
+        self.customer_min_limit_decrease = 50000.0
 
 
 class LargePrecomputedGridCalculator(OptimalCreditLimitCalculator):
@@ -198,6 +205,43 @@ class LargePrecomputedGridCalculator(OptimalCreditLimitCalculator):
             "thresholds_usage": {},
             "thresholds_default": {},
         }
+
+        utilization_path = str(getattr(
+            self.config, "utilization_lookup_file", "utilization_customer_lookup.csv"
+        ))
+        if not os.path.isfile(utilization_path):
+            raise FileNotFoundError(
+                "未找到客户支用率表: %s；请先运行 notebook 的清洗/支用率统计 Cell。"
+                % utilization_path
+            )
+        utilization = pd.read_csv(
+            utilization_path, encoding=csv_encoding, dtype={"cst_id": str}
+        )
+        utilization_col = str(getattr(self.config, "utilization_column", "utilization_used"))
+        required_utilization = {
+            "cst_id", "utilization_method", "utilization_raw", utilization_col
+        }
+        missing_utilization = sorted(required_utilization - set(utilization.columns))
+        if missing_utilization:
+            raise ValueError("客户支用率表缺少字段: %s" % missing_utilization)
+        if utilization["cst_id"].duplicated().any():
+            raise ValueError("客户支用率表 cst_id 存在重复")
+        utilization = utilization.set_index("cst_id")
+        work_ids = work["cst_id"].astype(str)
+        missing_ids = work_ids[~work_ids.isin(utilization.index)]
+        if len(missing_ids):
+            raise ValueError("客户支用率表缺少当前客户，示例: %s" % missing_ids.head(10).tolist())
+        aligned_utilization = utilization.loc[work_ids].reset_index(drop=True)
+        for col in ("utilization_raw", utilization_col):
+            self.data_info["df_aggregated"][col] = pd.to_numeric(
+                aligned_utilization[col], errors="coerce"
+            ).to_numpy(dtype=float)
+        utilization_methods = aligned_utilization["utilization_method"].dropna().astype(str).unique()
+        if len(utilization_methods) != 1:
+            raise ValueError("客户支用率表中的 utilization_method 必须全表一致")
+        self.data_info["utilization_method"] = str(utilization_methods[0])
+        if not np.isfinite(self.data_info["df_aggregated"][utilization_col]).all():
+            raise ValueError("客户支用率存在空值或非有限值")
         print(f"数据加载完成，样本数: {len(X_usage)}")
         # 大规模网格：不调用父类 _auto_configure（避免旧版 seaborn 画图报错，且 grid 上下限由 main 配置）
         df = self.data_info.get("df_aggregated")
@@ -212,6 +256,18 @@ class LargePrecomputedGridCalculator(OptimalCreditLimitCalculator):
         """不训练模型，只读取预计算概率网格，并保存原始额度对应概率。"""
         print("读取大规模预计算概率网格，不训练模型...")
         self.load_probability_grid()
+
+        # 频繁支用概率网格不再进入目标函数。保留原网格文件以兼容既有目录，
+        # 运行时用客户历史支用率构造零拷贝的静态二维视图。
+        utilization_col = str(getattr(self.config, "utilization_column", "utilization_used"))
+        utilization = pd.to_numeric(
+            self.data_info["df_aggregated"][utilization_col], errors="coerce"
+        ).to_numpy(dtype=np.float32)
+        grid_width = int(self.prob_grid["p_default"].shape[1])
+        utilization_grid = np.broadcast_to(utilization[:, None], (len(utilization), grid_width))
+        self.prob_grid["p_usage"] = utilization_grid
+        self.prob_grid["p_usage_raw"] = utilization_grid
+        print("  目标函数支用项已切换为客户历史支用率；频繁支用概率网格未使用")
 
         # 字段名兼容：聚合后为 credamt；旧版可能仍叫 授信额度
         _df_agg = self.data_info["df_aggregated"]
@@ -738,7 +794,10 @@ class LargePrecomputedGridCalculator(OptimalCreditLimitCalculator):
             pu = np.asarray(p_usage[start:end], dtype=np.float32)
             pd_ = self._effective_default_prob(np.asarray(p_default[start:end], dtype=np.float32))
             unit_profit_no_lambda = (
-                rates[:, None] * pu - lgd[:, None] * pd_ - c1 - c2 * grid.reshape(1, -1)
+                rates[:, None] * pu
+                - lgd[:, None] * pd_ * pu
+                - c1
+                - c2 * grid.reshape(1, -1)
             )
             value_per_limit = unit_profit_no_lambda - float(lam)
 
@@ -753,7 +812,7 @@ class LargePrecomputedGridCalculator(OptimalCreditLimitCalculator):
             total_count += int(value_per_limit.size)
 
         print("\n" + "=" * 80)
-        print("目标函数单位值诊断 = rate*p_usage - LGD*p_default - c1 - c2*L - lambda")
+        print("目标函数单位值诊断 = rate*u - lambda_LGD*p_default*u - c1 - c2*L - lambda")
         print("=" * 80)
         print("诊断范围: 全量客户 %d, grid点数: %d, lambda=%.12f" % (n, len(grid), float(lam)))
         print("不含 lambda 的单位利润 unit_profit_no_lambda:")
@@ -1078,11 +1137,11 @@ class LargePrecomputedGridCalculator(OptimalCreditLimitCalculator):
         return float(values.sum())
 
     def _calculate_expected_loss(self, L_list, talent_levels):
-        """用查表违约概率计算 LGD 折算后的模型预期损失。"""
+        """按 lambda_LGD * L * p_default * utilization 计算预期损失。"""
         L = np.asarray(L_list, dtype=float)
-        _, p_default = self._lookup_probabilities(L)
+        utilization, p_default = self._lookup_probabilities(L)
         lgd = float(getattr(self.config, "lgd_coefficient", 0.45))
-        return float((lgd * p_default * L).sum())
+        return float((lgd * p_default * utilization * L).sum())
 
     def _calculate_weighted_default_risk(self, L_list):
         """计算额度加权模型预测违约风险（不乘 LGD）。"""
@@ -1111,6 +1170,24 @@ class LargePrecomputedGridCalculator(OptimalCreditLimitCalculator):
         levels = np.asarray(talent_levels, dtype=int)
         L_min, L_max, lgd, rates = self._level_arrays(levels)
         base_limits = base_limits_raw.astype(float).copy()
+        if bool(getattr(self.config, "customer_min_limit_enabled", True)):
+            tier_min_limits = np.asarray(
+                [self.config.min_limit.get(int(g), 0.0) for g in levels], dtype=float
+            )
+            customer_min_limits = np.maximum.reduce(
+                [
+                    np.zeros(len(base_limits), dtype=float),
+                    base_limits - float(getattr(
+                        self.config, "customer_min_limit_decrease", 50000.0
+                    )),
+                    tier_min_limits,
+                ]
+            )
+        else:
+            customer_min_limits = np.asarray(
+                [self.config.min_limit.get(int(g), 0.0) for g in levels], dtype=float
+            )
+        self.customer_min_limits = customer_min_limits.copy()
 
         self.data_info["base_limits_raw"] = base_limits_raw.astype(float).copy()
         self.data_info["base_limits"] = base_limits.copy()
@@ -1134,7 +1211,7 @@ class LargePrecomputedGridCalculator(OptimalCreditLimitCalculator):
             p_usage=self.prob_grid["p_usage"],
             p_default=self.prob_grid["p_default"],
             levels=levels,
-            min_limits=self.config.min_limit,
+            min_limits=customer_min_limits,
             max_limits=self.config.max_limit,
             interest_rates=rates,
             lgd_coefficients=lgd,
@@ -1272,6 +1349,17 @@ class LargePrecomputedGridCalculator(OptimalCreditLimitCalculator):
             "optimized_weighted_default_risk": optimal_L * cal_d_opt,
             "interest_rate": rates,
             "lgd_coefficient": lgd,
+            "customer_minimum_limit": customer_min_limits,
+            "utilization_raw": pd.to_numeric(
+                df_agg["utilization_raw"], errors="coerce"
+            ).to_numpy(dtype=float),
+            "utilization_used": pd.to_numeric(
+                df_agg[str(getattr(self.config, "utilization_column", "utilization_used"))],
+                errors="coerce",
+            ).to_numpy(dtype=float),
+            "utilization_method": str(self.data_info.get("utilization_method", "unknown")),
+            "gross_interest_rate": float(getattr(self.config, "gross_interest_rate", 0.03)),
+            "ftp_rate": float(getattr(self.config, "ftp_rate", 0.02)),
         })
         # Compatibility aliases used by reports/viz: calibrated probabilities at optimized limits.
         df_results["predicted_usage_prob"] = df_results["optimized_usage_prob_calibrated"]
@@ -1314,13 +1402,30 @@ class LargePrecomputedGridCalculator(OptimalCreditLimitCalculator):
         base_limits = pd.to_numeric(
             df_agg[credit_column], errors="coerce"
         ).fillna(0.0).to_numpy(dtype=float)
+        if bool(getattr(self.config, "customer_min_limit_enabled", True)):
+            tier_min_limits = np.asarray(
+                [self.config.min_limit.get(int(g), 0.0) for g in levels], dtype=float
+            )
+            customer_min_limits = np.maximum.reduce(
+                [
+                    np.zeros(len(base_limits), dtype=float),
+                    base_limits - float(getattr(
+                        self.config, "customer_min_limit_decrease", 50000.0
+                    )),
+                    tier_min_limits,
+                ]
+            )
+        else:
+            customer_min_limits = np.asarray(
+                [self.config.min_limit.get(int(g), 0.0) for g in levels], dtype=float
+            )
         _, _, lgd, rates = self._level_arrays(levels)
         common_candidate_table = build_portfolio_candidate_table(
             grid=self.prob_grid["grid"],
             p_usage=self.prob_grid["p_usage"],
             p_default=self.prob_grid["p_default"],
             levels=levels,
-            min_limits=self.config.min_limit,
+            min_limits=customer_min_limits,
             max_limits=self.config.max_limit,
             interest_rates=rates,
             lgd_coefficients=lgd,
@@ -1505,7 +1610,7 @@ class LargePrecomputedGridCalculator(OptimalCreditLimitCalculator):
         )
 
         levels = work["talent_level"].to_numpy(dtype=int)
-        lower = np.asarray([self.config.min_limit.get(int(g), -np.inf) for g in levels])
+        lower = work["customer_minimum_limit"].to_numpy(dtype=float)
         upper = np.asarray([self.config.max_limit.get(int(g), np.inf) for g in levels])
         opt = work["credit_limit"].to_numpy(dtype=float)
         boundary = pd.DataFrame([{
@@ -1809,8 +1914,12 @@ def main():
     _prob_grid_dir = _g.get("PROB_GRID_DIR_OPT_OVERRIDE", _g.get("PROB_GRID_DIR", "probability_grid_large"))
     _reports_dir   = _g.get("REPORTS_DIR_OPT_OVERRIDE",   _g.get("REPORTS_DIR",  "reports"))
     _interest_rate = float(_g.get("INTEREST_RATE_OPT_OVERRIDE", _g.get("INTEREST_RATE", 0.03)))
+    _ftp_rate       = float(_g.get("FTP_RATE_OPT_OVERRIDE", _g.get("FTP_RATE", 0.02)))
     _lgd            = float(_g.get("LGD_COEFFICIENT_OPT_OVERRIDE", _g.get("LGD_COEFFICIENT", 0.45)))
     _linear_cost    = float(_g.get("LINEAR_COST_OPT_OVERRIDE", _g.get("LINEAR_COST", 0.005)))
+    _linear_cost_mode = str(_g.get(
+        "LINEAR_COST_MODE_OPT_OVERRIDE", _g.get("LINEAR_COST_MODE", "manual")
+    )).strip().lower()
     _quadratic_cost = float(_g.get("QUADRATIC_COST_OPT_OVERRIDE", _g.get("QUADRATIC_COST", 1e-9)))
     _scope          = str(_g.get("OPTIMIZATION_SCOPE_OVERRIDE", "all"))
     _total_budget_override = _g.get("TOTAL_BUDGET_OPT_OVERRIDE", None)
@@ -1818,6 +1927,14 @@ def main():
     _risk_tolerance = float(_g.get("RISK_TOLERANCE_OPT_OVERRIDE", 1.05))
     _group_mean_min_ratio = dict(_g.get(
         "GROUP_MEAN_MIN_RATIO_OPT_OVERRIDE", {2: 1.0, 3: 1.0, 4: 0.8, 5: 0.8}
+    ))
+    _customer_min_limit_enabled = bool(_g.get(
+        "CUSTOMER_MIN_LIMIT_ENABLED_OPT_OVERRIDE",
+        _g.get("CUSTOMER_MIN_LIMIT_ENABLED", True),
+    ))
+    _customer_min_limit_decrease = float(_g.get(
+        "CUSTOMER_MIN_LIMIT_DECREASE_OPT_OVERRIDE",
+        _g.get("CUSTOMER_MIN_LIMIT_DECREASE", 50000.0),
     ))
     _c2_selection_mode = bool(_g.get("C2_SELECTION_MODE_OVERRIDE", False))
     _c2_candidates = tuple(_g.get("C2_CANDIDATES_OPT_OVERRIDE", (_quadratic_cost,)))
@@ -1830,6 +1947,10 @@ def main():
     _grid_max      = float(_g.get("GRID_MAX_OPT_OVERRIDE",  _g.get("GRID_MAX",  1000000.0)))
     _grid_step     = float(_g.get("GRID_STEP_OPT_OVERRIDE", _g.get("GRID_STEP", 500.0)))
     _cleaned_file  = _g.get("CLEANED_FILE_OPT_OVERRIDE",  _g.get("CLEANED_FILE", "data_cleaned.csv"))
+    _utilization_lookup_file = _g.get(
+        "UTILIZATION_LOOKUP_FILE_OPT_OVERRIDE",
+        _g.get("UTILIZATION_LOOKUP_FILE", "utilization_customer_lookup.csv"),
+    )
     _tier_min       = _g.get("TIER_MIN_LIMITS_OPT_OVERRIDE", _g.get("TIER_MIN_LIMITS", {}))
     _tier_max       = _g.get("TIER_MAX_LIMITS_OPT_OVERRIDE", _g.get("TIER_MAX_LIMITS", {}))
     _reuse_optimization = bool(_g.get("REUSE_OPTIMIZATION_OVERRIDE", _g.get("REUSE_OPTIMIZATION", False)))
@@ -1877,12 +1998,19 @@ def main():
     print(f"  概率网格目录    : {_prob_grid_dir}")
     print(f"  结果目录        : {_reports_dir}")
     print(f"  interest_rate   : {_interest_rate}")
-    print(f"  LGD coefficient : {_lgd}")
+    print(f"  FTP rate (configured): {_ftp_rate}")
+    print(f"  lambda_LGD      : {_lgd}")
     print(f"  linear cost     : {_linear_cost}")
+    print(f"  linear cost mode: {_linear_cost_mode}")
     print(f"  quadratic cost  : {_quadratic_cost}")
     print(f"  optimization scope: {_scope}")
     print(f"  risk tolerance   : {_risk_tolerance}")
     print(f"  group mean ratios: {_group_mean_min_ratio}")
+    _customer_lower_bound_label = (
+        f"max(0, original limit - {_customer_min_limit_decrease:,.0f}, tier minimum)"
+        if _customer_min_limit_enabled else "tier lower bound"
+    )
+    print(f"  customer lower bound: {_customer_lower_bound_label}")
     print(f"  solver backend    : {_solver_backend}")
     if _solver_backend == "lagrangian":
         print(
@@ -1915,6 +2043,11 @@ def main():
     config.prob_grid_path   = _prob_grid_dir
     config.excel_path       = _excel_path
     config.cleaned_file     = _cleaned_file
+    config.utilization_lookup_file = _utilization_lookup_file
+    config.utilization_column = "utilization_used"
+    config.gross_interest_rate = _interest_rate
+    config.ftp_rate = _ftp_rate
+    config.linear_cost_mode = _linear_cost_mode
     config.csv_encoding     = _g.get("CSV_ENCODING_OPT_OVERRIDE", _g.get("CSV_ENCODING", "utf-8-sig"))
     config.snapshot_date    = _g.get("SNAPSHOT_DATE_OPT_OVERRIDE", _g.get("SNAPSHOT_DATE", "2026-01-31"))
     config.apply_maturity_filter = bool(_g.get("APPLY_MATURITY_FILTER_OPT_OVERRIDE", _g.get("APPLY_MATURITY_FILTER", False)))
@@ -1925,12 +2058,22 @@ def main():
     config.eff_date_upper   = _g.get("EFF_DATE_UPPER_OPT_OVERRIDE", _g.get("EFF_DATE_UPPER", "2026-03-31"))
     config.y_freq_mode      = _g.get("Y_FREQ_MODE_OPT_OVERRIDE", _g.get("Y_FREQ_MODE", "bout_gt0_and_curr_p80"))
     config.lgd_coefficient  = _lgd
-    config.linear_cost      = _linear_cost
+    if _linear_cost_mode == "ftp_utilization":
+        # r*L*u - FTP*L*u 等价于 (r-FTP)*L*u。
+        _objective_interest_rate = _interest_rate - _ftp_rate
+        config.linear_cost = 0.0
+    elif _linear_cost_mode == "manual":
+        _objective_interest_rate = _interest_rate
+        config.linear_cost = _linear_cost
+    else:
+        raise ValueError("LINEAR_COST_MODE 只能为 'manual' 或 'ftp_utilization'")
     config.quadratic_cost   = _quadratic_cost
     config.total_budget_override = None if _total_budget_override is None else float(_total_budget_override)
     config.risk_budget      = None if _risk_budget_override is None else float(_risk_budget_override)
     config.risk_tolerance   = _risk_tolerance
     config.group_mean_min_ratio = {int(k): float(v) for k, v in _group_mean_min_ratio.items()}
+    config.customer_min_limit_enabled = _customer_min_limit_enabled
+    config.customer_min_limit_decrease = _customer_min_limit_decrease
     config.optimization_scope = _scope
     config.optimization_sample_enabled = _sample_enabled
     config.optimization_sample_size = None if _sample_size is None else int(_sample_size)
@@ -1967,10 +2110,14 @@ def main():
         config.min_limit[level] = float(_tier_min.get(level, 0.0))
         config.max_limit[level] = float(_tier_max.get(level, _grid_max))
     for level in [1, 2, 3, 4, 5, 6, 7, 8]:
-        config.interest_rates[level] = _interest_rate
+        config.interest_rates[level] = _objective_interest_rate
 
     print(f"[DEBUG] prob_grid_path = {config.prob_grid_path}")
-    print(f"[DEBUG] 目标函数参数: r={_interest_rate}, LGD={_lgd}, c1={_linear_cost}, c2={_quadratic_cost}")
+    print(
+        f"[DEBUG] 目标函数参数: gross_r={_interest_rate}, FTP={_ftp_rate}, "
+        f"objective_rate={_objective_interest_rate}, lambda_LGD={_lgd}, "
+        f"c1={config.linear_cost}, c2={_quadratic_cost}"
+    )
 
     calculator = LargePrecomputedGridCalculator(config)
 

@@ -4,8 +4,8 @@
 
 目标函数（对客户 i、候选额度 L）为：
 
-    pi_i(L) = r_i * L * p_usage_i(L)
-              - lgd_i * L * p_default_i(L)
+    pi_i(L) = r_i * L * u_i
+              - lambda_lgd_i * L * p_default_i(L) * u_i
               - c1 * L
               - c2 * L ** 2
 
@@ -91,7 +91,12 @@ def risk_adjusted_value(
     pd_ = np.asarray(p_default, dtype=float)
     r = np.asarray(interest_rates, dtype=float)
     lgd = np.asarray(lgd_coefficients, dtype=float)
-    return r * L * pu - lgd * L * pd_ - float(linear_cost) * L - float(quadratic_cost) * L ** 2
+    return (
+        r * L * pu
+        - lgd * L * pd_ * pu
+        - float(linear_cost) * L
+        - float(quadratic_cost) * L ** 2
+    )
 
 
 def _nearest_grid_indices(values, grid):
@@ -101,6 +106,17 @@ def _nearest_grid_indices(values, grid):
     idx = np.clip(idx, 0, len(grid) - 1)
     left = np.clip(idx - 1, 0, len(grid) - 1)
     return np.where(np.abs(grid[left] - values) <= np.abs(grid[idx] - values), left, idx).astype(int)
+
+
+def _customer_bounds(spec, levels, default):
+    """Resolve a tier dictionary or a customer-aligned vector into row bounds."""
+    levels = np.asarray(levels, dtype=int)
+    if hasattr(spec, "get"):
+        return np.asarray([spec.get(int(g), default) for g in levels], dtype=float)
+    values = np.asarray(spec, dtype=float).reshape(-1)
+    if len(values) != len(levels):
+        raise ValueError("客户级额度边界长度必须与客户数一致")
+    return values
 
 
 def _candidate_index_table(
@@ -123,8 +139,8 @@ def _candidate_index_table(
     grid = np.asarray(grid, dtype=float)
     levels = np.asarray(levels, dtype=int)
     n = len(levels)
-    lo = np.asarray([min_limits.get(int(g), float(grid[0])) for g in levels], dtype=float)
-    hi = np.asarray([max_limits.get(int(g), float(grid[-1])) for g in levels], dtype=float)
+    lo = _customer_bounds(min_limits, levels, float(grid[0]))
+    hi = _customer_bounds(max_limits, levels, float(grid[-1]))
     lo_idx = np.searchsorted(grid, lo - 1e-9, side="left")
     hi_idx = np.searchsorted(grid, hi + 1e-9, side="right") - 1
     lo_idx = np.clip(lo_idx, 0, len(grid) - 1)
@@ -365,8 +381,8 @@ def audit_portfolio_constraints(
     if not (len(limits) == len(weighted_risk) == len(levels)):
         raise ValueError("额度、风险和人才等级长度必须一致")
 
-    lower = np.asarray([min_limits.get(int(g), -np.inf) for g in levels], dtype=float)
-    upper = np.asarray([max_limits.get(int(g), np.inf) for g in levels], dtype=float)
+    lower = _customer_bounds(min_limits, levels, -np.inf)
+    upper = _customer_bounds(max_limits, levels, np.inf)
     scale_limit = max(float(np.max(np.abs(upper[np.isfinite(upper)]))) if np.isfinite(upper).any() else 0.0, 1.0)
     budget_scale = max(abs(float(total_budget)), 1.0)
     risk_scale = max(abs(float(risk_budget)), 1.0)

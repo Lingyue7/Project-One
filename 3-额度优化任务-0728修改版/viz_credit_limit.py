@@ -165,6 +165,8 @@ print("  Fig 2/3 概率口径: 五折样本外 + Isotonic 校准后（优化额�
 _grid = np.load(os.path.join(_grid_dir_used, "grid.npy"))
 _p_usage = np.load(os.path.join(_grid_dir_used, "p_usage.npy"), mmap_mode="r")
 _p_default = np.load(os.path.join(_grid_dir_used, "p_default.npy"), mmap_mode="r")
+_p_usage_raw = np.load(os.path.join(_grid_dir_used, "p_usage_raw.npy"), mmap_mode="r")
+_p_default_raw = np.load(os.path.join(_grid_dir_used, "p_default_raw.npy"), mmap_mode="r")
 
 _dbg("B", "viz_credit_limit.py:grid", "loaded probability grid", {
     "grid_min": float(np.nanmin(_grid)),
@@ -188,7 +190,24 @@ def _lookup(L_array):
     )
 
 
+def _lookup_raw(L_array):
+    idx = np.searchsorted(_grid, L_array)
+    idx = np.clip(idx, 0, len(_grid) - 1)
+    left = np.clip(idx - 1, 0, len(_grid) - 1)
+    use_left = np.abs(_grid[left] - L_array) <= np.abs(_grid[idx] - L_array)
+    idx = np.where(use_left, left, idx).astype(int)
+    rows = np.arange(len(idx))
+    return (
+        np.asarray(_p_usage_raw[rows, idx], dtype=float),
+        np.asarray(_p_default_raw[rows, idx], dtype=float),
+    )
+
+
 p_u_base, p_d_base = _lookup(orig_L)
+# Fig 2/3/5 必须直接从原始概率网格取频繁支用概率，不能使用优化结果表中的
+# utilization_used（历史支用率）。下列四个数组均对应优化后额度点。
+p_u_o, p_d_o = _lookup(opt_L)
+p_u_raw_o, p_d_raw_o = _lookup_raw(opt_L)
 
 # -- Load true labels (y_freq / y_dq_risk) from work_features.csv --
 _work_path = os.path.join(_grid_dir_used, "work_features.csv")
@@ -565,8 +584,26 @@ print("  Saved: usage_prob_bar.png")
 # ============================================================
 print("[Fig 4] Unit risk-adjusted objective before vs after optimization by tier...")
 
-unit_base = INTEREST_RATE * p_u_base - LGD_COEFFICIENT * p_d_base - LINEAR_COST - QUADRATIC_COST * orig_L
-unit_opt = INTEREST_RATE * p_u_o - LGD_COEFFICIENT * p_d_o - LINEAR_COST - QUADRATIC_COST * opt_L
+if "utilization_used" not in df_results.columns:
+    raise ValueError("优化结果缺少 utilization_used，无法按当前目标函数计算 Fig 4/5")
+historical_utilization = pd.to_numeric(
+    df_results["utilization_used"], errors="coerce"
+).to_numpy(dtype=float)
+if not np.isfinite(historical_utilization).all():
+    raise ValueError("utilization_used 存在空值或非有限值")
+
+unit_base = (
+    INTEREST_RATE * historical_utilization
+    - LGD_COEFFICIENT * p_d_base * historical_utilization
+    - LINEAR_COST
+    - QUADRATIC_COST * orig_L
+)
+unit_opt = (
+    INTEREST_RATE * historical_utilization
+    - LGD_COEFFICIENT * p_d_o * historical_utilization
+    - LINEAR_COST
+    - QUADRATIC_COST * opt_L
+)
 unit_base = np.where(orig_L > 0, unit_base, 0.0)
 unit_opt = np.where(opt_L > 0, unit_opt, 0.0)
 
@@ -611,7 +648,7 @@ print("  Saved: unit_profit.png")
 # ============================================================
 # Fig 5: Tier summary table
 # ============================================================
-print("[Fig 5] Tier summary table (true rates + predicted probabilities)...")
+print("[Fig 5] Tier summary table (raw/calibrated frequency-usage and default probabilities)...")
 
 _rows = []
 for tier in TIER_ORDER:
@@ -626,11 +663,30 @@ for tier in TIER_ORDER:
         "Orig Median (w)": round(np.median(orig_L[mask]) / 10000, 2),
         "Opt Mean (w)": round(opt_L[mask].mean() / 10000, 2),
         "Opt Median (w)": round(np.median(opt_L[mask]) / 10000, 2),
-        "True Usage Rate": ("%.2f%%" % (np.nanmean(y_freq_true[mask]) * 100)) if y_freq_true is not None else "N/A",
+        "True Freq Rate": ("%.2f%%" % (np.nanmean(y_freq_true[mask]) * 100)) if y_freq_true is not None else "N/A",
         "True Default Rate": ("%.2f%%" % (np.nanmean(y_dq_true[mask]) * 100)) if y_dq_true is not None else "N/A",
-        "Pred Usage (opt)": "%.2f%%" % (p_u_o[mask].mean() * 100),
-        "Pred Default (opt)": "%.2f%%" % (p_d_o[mask].mean() * 100),
+        "Avg Utilization": "%.2f%%" % (historical_utilization[mask].mean() * 100),
+        "Pred Freq Raw (opt)": "%.2f%%" % (p_u_raw_o[mask].mean() * 100),
+        "Pred Default Raw (opt)": "%.2f%%" % (p_d_raw_o[mask].mean() * 100),
+        "Pred Freq Cal (opt)": "%.2f%%" % (p_u_o[mask].mean() * 100),
+        "Pred Default Cal (opt)": "%.2f%%" % (p_d_o[mask].mean() * 100),
     }
+    _avg_u = float(historical_utilization[mask].mean())
+    _avg_pd_cal = float(p_d_o[mask].mean())
+    _avg_opt_l = float(opt_L[mask].mean())
+    _income_term = INTEREST_RATE * _avg_u
+    _risk_term = LGD_COEFFICIENT * _avg_u * _avg_pd_cal
+    _c1_term = LINEAR_COST
+    _c2_term = QUADRATIC_COST * _avg_opt_l
+    row.update({
+        "Revenue r*AvgU": round(_income_term, 6),
+        "Risk lambda*AvgU*AvgPD": round(_risk_term, 6),
+        "Cost c1": round(_c1_term, 6),
+        "Cost c2*AvgL": round(_c2_term, 6),
+        "Net Revenue-Risk-c1-c2": round(
+            _income_term - _risk_term - _c1_term - _c2_term, 6
+        ),
+    })
     _rows.append(row)
 
 df_summary = pd.DataFrame(_rows)
@@ -648,7 +704,7 @@ fig5, ax5 = plt.subplots(
 )
 ax5.axis("off")
 ax5.set_title(
-    "Tier Summary: Original/Optimized Limits, True Rates, Predicted Probabilities",
+    "Tier Summary: Limits, Raw/Calibrated Model Probabilities, Objective Components",
     fontsize=12,
     pad=10,
     fontweight="bold",
