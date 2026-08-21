@@ -29,7 +29,18 @@ from typing import Optional, Tuple
 import numpy as np
 import pandas as pd
 
-OPTIMIZER_STATE_VERSION = "customer_and_tier_combined_lower_bound_v13"
+OPTIMIZER_STATE_VERSION = "runtime_minimum_limit_policy_v15"
+DEFAULT_CUSTOMER_MIN_LIMIT_DECREASE = 10_000.0
+DEFAULT_TIER_MIN_LIMITS = {
+    1: 1_000.0,
+    2: 1_000.0,
+    3: 1_000.0,
+    4: 20_000.0,
+    5: 100_000.0,
+    6: 0.0,
+    7: 0.0,
+    8: 0.0,
+}
 
 from load_kechuang_potential_data import (
     read_data,
@@ -59,6 +70,61 @@ from portfolio_milp_optimizer import (
     solve_discrete_portfolio_lagrangian,
     solve_discrete_portfolio_milp,
 )
+def audit_runtime_minimum_limit_policy(
+    result_df,
+    expected_tier_min_limits,
+    expected_customer_min_limit_decrease,
+):
+    """核验结果表实际使用的等级下限、客户降幅和逐客户硬下限。"""
+    required = {
+        "talent_level",
+        "original_credit_limit",
+        "tier_minimum_limit",
+        "customer_minimum_limit",
+        "customer_min_limit_decrease",
+    }
+    missing = sorted(required - set(result_df.columns))
+    if missing:
+        raise ValueError("额度结果缺少下限政策审计字段: %s" % missing)
+    levels = pd.to_numeric(result_df["talent_level"], errors="raise").to_numpy(dtype=int)
+    original = pd.to_numeric(
+        result_df["original_credit_limit"], errors="raise"
+    ).to_numpy(dtype=float)
+    actual_tier = pd.to_numeric(
+        result_df["tier_minimum_limit"], errors="raise"
+    ).to_numpy(dtype=float)
+    actual_customer = pd.to_numeric(
+        result_df["customer_minimum_limit"], errors="raise"
+    ).to_numpy(dtype=float)
+    actual_decrease = pd.to_numeric(
+        result_df["customer_min_limit_decrease"], errors="raise"
+    ).to_numpy(dtype=float)
+    expected_decrease = float(expected_customer_min_limit_decrease)
+    expected_tier = np.asarray([
+        float(expected_tier_min_limits.get(
+            int(level), expected_tier_min_limits.get(str(int(level)), 0.0)
+        ))
+        for level in levels
+    ])
+    expected_customer = np.maximum(expected_tier, original - expected_decrease)
+    if not np.allclose(actual_tier, expected_tier, rtol=0.0, atol=1e-9):
+        raise ValueError("结果中的等级最低额度与本次 TIER_MIN_LIMIT_POLICY 不一致")
+    if not np.allclose(actual_decrease, expected_decrease, rtol=0.0, atol=1e-9):
+        raise ValueError("结果中的 CUSTOMER_MIN_LIMIT_DECREASE 与本次配置不一致")
+    if not np.allclose(actual_customer, expected_customer, rtol=0.0, atol=1e-9):
+        raise ValueError("结果中的逐客户额度硬下限计算错误")
+    summary = result_df.assign(
+        _tier_minimum_limit=actual_tier,
+        _customer_minimum_limit=actual_customer,
+    ).groupby("talent_level", as_index=False).agg(
+        customer_count=("talent_level", "size"),
+        tier_minimum_limit=("_tier_minimum_limit", "first"),
+        resolved_customer_minimum_min=("_customer_minimum_limit", "min"),
+        resolved_customer_minimum_max=("_customer_minimum_limit", "max"),
+    )
+    print("✓ 结果级额度下限政策校验通过")
+    print(summary.to_string(index=False))
+    return summary
 
 
 class LargePrecomputedGridConfig(OptimalCreditLimitConfig):
@@ -117,7 +183,8 @@ class LargePrecomputedGridConfig(OptimalCreditLimitConfig):
         self.ftp_rate = 0.02
         self.linear_cost_mode = "manual"
         self.customer_min_limit_enabled = True
-        self.customer_min_limit_decrease = 50000.0
+        self.customer_min_limit_decrease = DEFAULT_CUSTOMER_MIN_LIMIT_DECREASE
+        self.min_limit.update(DEFAULT_TIER_MIN_LIMITS)
 
 
 class LargePrecomputedGridCalculator(OptimalCreditLimitCalculator):
@@ -1149,6 +1216,27 @@ class LargePrecomputedGridCalculator(OptimalCreditLimitCalculator):
         _, p_default = self._lookup_probabilities(L)
         return float((p_default * L).sum())
 
+    def _resolve_customer_minimum_limits(self, base_limits, talent_levels):
+        """合并等级下限与客户原额度最大允许降幅，返回逐客户硬下限。"""
+        base_limits = np.asarray(base_limits, dtype=float).reshape(-1)
+        levels = np.asarray(talent_levels, dtype=int).reshape(-1)
+        if len(base_limits) != len(levels):
+            raise ValueError("原额度与人才等级长度必须一致")
+        tier_min_limits = np.asarray(
+            [self.config.min_limit.get(int(level), 0.0) for level in levels],
+            dtype=float,
+        )
+        if not bool(getattr(self.config, "customer_min_limit_enabled", True)):
+            return tier_min_limits
+        return np.maximum(
+            tier_min_limits,
+            base_limits - float(getattr(
+                self.config,
+                "customer_min_limit_decrease",
+                DEFAULT_CUSTOMER_MIN_LIMIT_DECREASE,
+            )),
+        )
+
     def calculate_optimal_limits(
         self,
         talent_levels,
@@ -1170,24 +1258,29 @@ class LargePrecomputedGridCalculator(OptimalCreditLimitCalculator):
         levels = np.asarray(talent_levels, dtype=int)
         L_min, L_max, lgd, rates = self._level_arrays(levels)
         base_limits = base_limits_raw.astype(float).copy()
-        if bool(getattr(self.config, "customer_min_limit_enabled", True)):
-            tier_min_limits = np.asarray(
-                [self.config.min_limit.get(int(g), 0.0) for g in levels], dtype=float
-            )
-            customer_min_limits = np.maximum.reduce(
-                [
-                    np.zeros(len(base_limits), dtype=float),
-                    base_limits - float(getattr(
-                        self.config, "customer_min_limit_decrease", 50000.0
-                    )),
-                    tier_min_limits,
-                ]
-            )
-        else:
-            customer_min_limits = np.asarray(
-                [self.config.min_limit.get(int(g), 0.0) for g in levels], dtype=float
-            )
+        customer_min_limits = self._resolve_customer_minimum_limits(
+            base_limits, levels
+        )
         self.customer_min_limits = customer_min_limits.copy()
+        tier_minimum_limits = np.asarray(
+            [self.config.min_limit.get(int(level), 0.0) for level in levels],
+            dtype=float,
+        )
+        _tier_label = {8: "A", 7: "B", 6: "C", 5: "D", 4: "E", 3: "F1", 2: "F2", 1: "F3"}
+        _minimum_policy_rows = []
+        for _level in sorted(np.unique(levels).tolist()):
+            _mask = levels == int(_level)
+            _minimum_policy_rows.append({
+                "talent_level": int(_level),
+                "tier": _tier_label.get(int(_level), str(_level)),
+                "customer_count": int(_mask.sum()),
+                "tier_minimum_limit": float(self.config.min_limit.get(int(_level), 0.0)),
+                "customer_min_limit_decrease": float(self.config.customer_min_limit_decrease),
+                "resolved_customer_minimum_min": float(customer_min_limits[_mask].min()),
+                "resolved_customer_minimum_max": float(customer_min_limits[_mask].max()),
+            })
+        print("实际生效的客户额度下限政策:")
+        print(pd.DataFrame(_minimum_policy_rows).to_string(index=False))
 
         self.data_info["base_limits_raw"] = base_limits_raw.astype(float).copy()
         self.data_info["base_limits"] = base_limits.copy()
@@ -1348,8 +1441,19 @@ class LargePrecomputedGridCalculator(OptimalCreditLimitCalculator):
             "original_weighted_default_risk": base_limits_raw * cal_d_orig,
             "optimized_weighted_default_risk": optimal_L * cal_d_opt,
             "interest_rate": rates,
+            "objective_interest_rate": rates,
             "lgd_coefficient": lgd,
+            "linear_cost": float(getattr(self.config, "linear_cost", 0.0)),
+            "quadratic_cost": float(getattr(self.config, "quadratic_cost", 0.0)),
+            "objective_parameter_source": "optimizer_runtime_config",
+            "linear_cost_mode": str(getattr(self.config, "linear_cost_mode", "manual")),
+            "tier_minimum_limit": tier_minimum_limits,
             "customer_minimum_limit": customer_min_limits,
+            "customer_min_limit_decrease": float(getattr(
+                self.config,
+                "customer_min_limit_decrease",
+                DEFAULT_CUSTOMER_MIN_LIMIT_DECREASE,
+            )),
             "utilization_raw": pd.to_numeric(
                 df_agg["utilization_raw"], errors="coerce"
             ).to_numpy(dtype=float),
@@ -1402,23 +1506,9 @@ class LargePrecomputedGridCalculator(OptimalCreditLimitCalculator):
         base_limits = pd.to_numeric(
             df_agg[credit_column], errors="coerce"
         ).fillna(0.0).to_numpy(dtype=float)
-        if bool(getattr(self.config, "customer_min_limit_enabled", True)):
-            tier_min_limits = np.asarray(
-                [self.config.min_limit.get(int(g), 0.0) for g in levels], dtype=float
-            )
-            customer_min_limits = np.maximum.reduce(
-                [
-                    np.zeros(len(base_limits), dtype=float),
-                    base_limits - float(getattr(
-                        self.config, "customer_min_limit_decrease", 50000.0
-                    )),
-                    tier_min_limits,
-                ]
-            )
-        else:
-            customer_min_limits = np.asarray(
-                [self.config.min_limit.get(int(g), 0.0) for g in levels], dtype=float
-            )
+        customer_min_limits = self._resolve_customer_minimum_limits(
+            base_limits, levels
+        )
         _, _, lgd, rates = self._level_arrays(levels)
         common_candidate_table = build_portfolio_candidate_table(
             grid=self.prob_grid["grid"],
@@ -1623,6 +1713,20 @@ class LargePrecomputedGridCalculator(OptimalCreditLimitCalculator):
         }])
         boundary.to_csv(
             os.path.join(report_dir, "boundary_check.csv"), index=False, encoding="utf-8-sig"
+        )
+        minimum_policy = work.groupby(
+            ["talent_level", "tier"], as_index=False
+        ).agg(
+            customer_count=("customer_id", "size"),
+            tier_minimum_limit=("tier_minimum_limit", "first"),
+            customer_min_limit_decrease=("customer_min_limit_decrease", "first"),
+            resolved_customer_minimum_min=("customer_minimum_limit", "min"),
+            resolved_customer_minimum_max=("customer_minimum_limit", "max"),
+        ).sort_values("talent_level")
+        minimum_policy.to_csv(
+            os.path.join(report_dir, "minimum_limit_policy_by_tier.csv"),
+            index=False,
+            encoding="utf-8-sig",
         )
         concentration_shares(opt).to_csv(
             os.path.join(report_dir, "limit_concentration.csv"),
@@ -1934,7 +2038,7 @@ def main():
     ))
     _customer_min_limit_decrease = float(_g.get(
         "CUSTOMER_MIN_LIMIT_DECREASE_OPT_OVERRIDE",
-        _g.get("CUSTOMER_MIN_LIMIT_DECREASE", 50000.0),
+        _g.get("CUSTOMER_MIN_LIMIT_DECREASE", DEFAULT_CUSTOMER_MIN_LIMIT_DECREASE),
     ))
     _c2_selection_mode = bool(_g.get("C2_SELECTION_MODE_OVERRIDE", False))
     _c2_candidates = tuple(_g.get("C2_CANDIDATES_OPT_OVERRIDE", (_quadratic_cost,)))
@@ -1951,7 +2055,10 @@ def main():
         "UTILIZATION_LOOKUP_FILE_OPT_OVERRIDE",
         _g.get("UTILIZATION_LOOKUP_FILE", "utilization_customer_lookup.csv"),
     )
-    _tier_min       = _g.get("TIER_MIN_LIMITS_OPT_OVERRIDE", _g.get("TIER_MIN_LIMITS", {}))
+    _tier_min       = _g.get(
+        "TIER_MIN_LIMITS_OPT_OVERRIDE",
+        _g.get("TIER_MIN_LIMITS", DEFAULT_TIER_MIN_LIMITS),
+    )
     _tier_max       = _g.get("TIER_MAX_LIMITS_OPT_OVERRIDE", _g.get("TIER_MAX_LIMITS", {}))
     _reuse_optimization = bool(_g.get("REUSE_OPTIMIZATION_OVERRIDE", _g.get("REUSE_OPTIMIZATION", False)))
     _sample_enabled = bool(_g.get("OPTIMIZATION_SAMPLE_ENABLED_OPT_OVERRIDE", False))
@@ -2011,6 +2118,13 @@ def main():
         if _customer_min_limit_enabled else "tier lower bound"
     )
     print(f"  customer lower bound: {_customer_lower_bound_label}")
+    print("  resolved tier minimums:", {
+        int(level): float(_tier_min.get(
+            level,
+            _tier_min.get(str(level), DEFAULT_TIER_MIN_LIMITS.get(level, 0.0)),
+        ))
+        for level in range(1, 9)
+    })
     print(f"  solver backend    : {_solver_backend}")
     if _solver_backend == "lagrangian":
         print(
@@ -2107,7 +2221,10 @@ def main():
     )
     config.milp_relative_gap = float(_g.get("MILP_RELATIVE_GAP_OPT_OVERRIDE", 0.01))
     for level in [1, 2, 3, 4, 5, 6, 7, 8]:
-        config.min_limit[level] = float(_tier_min.get(level, 0.0))
+        config.min_limit[level] = float(_tier_min.get(
+            level,
+            _tier_min.get(str(level), DEFAULT_TIER_MIN_LIMITS.get(level, 0.0)),
+        ))
         config.max_limit[level] = float(_tier_max.get(level, _grid_max))
     for level in [1, 2, 3, 4, 5, 6, 7, 8]:
         config.interest_rates[level] = _objective_interest_rate
@@ -2163,14 +2280,51 @@ def main():
             ("linear_cost", config.linear_cost),
             ("quadratic_cost", config.quadratic_cost),
             ("risk_tolerance", config.risk_tolerance),
+            ("gross_interest_rate", config.gross_interest_rate),
+            ("ftp_rate", config.ftp_rate),
         ]:
             saved = float(np.asarray(state[key]).reshape(-1)[0])
             if not np.isclose(saved, float(current)):
                 raise ValueError("Saved %s=%s differs from current %s; rerun optimization." % (key, saved, current))
+        saved_interest_rates = json.loads(str(
+            np.asarray(state["interest_rates"]).reshape(-1)[0]
+        ))
+        saved_interest_rates = {
+            int(k): float(v) for k, v in saved_interest_rates.items()
+        }
+        current_interest_rates = {
+            int(k): float(v) for k, v in config.interest_rates.items()
+        }
+        if saved_interest_rates != current_interest_rates:
+            raise ValueError("Saved objective interest rates differ; rerun optimization.")
+        saved_linear_cost_mode = str(
+            np.asarray(state["linear_cost_mode"]).reshape(-1)[0]
+        )
+        if saved_linear_cost_mode != str(config.linear_cost_mode):
+            raise ValueError("Saved linear_cost_mode differs; rerun optimization.")
         saved_ratio = json.loads(str(np.asarray(state["group_mean_min_ratio"]).reshape(-1)[0]))
         saved_ratio = {int(k): float(v) for k, v in saved_ratio.items()}
         if saved_ratio != config.group_mean_min_ratio:
             raise ValueError("Saved group_mean_min_ratio differs from current policy; rerun optimization.")
+        saved_tier_min = json.loads(str(np.asarray(state["tier_min_limits"]).reshape(-1)[0]))
+        saved_tier_min = {int(k): float(v) for k, v in saved_tier_min.items()}
+        current_tier_min = {int(k): float(v) for k, v in config.min_limit.items()}
+        if saved_tier_min != current_tier_min:
+            raise ValueError("Saved tier_min_limits differs from current policy; rerun optimization.")
+        saved_customer_min_enabled = bool(
+            np.asarray(state["customer_min_limit_enabled"]).reshape(-1)[0]
+        )
+        saved_customer_min_decrease = float(
+            np.asarray(state["customer_min_limit_decrease"]).reshape(-1)[0]
+        )
+        if (
+            saved_customer_min_enabled != bool(config.customer_min_limit_enabled)
+            or not np.isclose(
+                saved_customer_min_decrease,
+                float(config.customer_min_limit_decrease),
+            )
+        ):
+            raise ValueError("Saved customer minimum-limit policy differs; rerun optimization.")
         saved_scope = str(np.asarray(state["optimization_scope"]).reshape(-1)[0])
         if saved_scope != config.optimization_scope:
             raise ValueError("Saved optimization_scope differs from current scope; rerun optimization.")
@@ -2268,8 +2422,21 @@ def main():
         lgd_coefficient=np.asarray([calculator.config.lgd_coefficient], dtype=float),
         linear_cost=np.asarray([calculator.config.linear_cost], dtype=float),
         quadratic_cost=np.asarray([calculator.config.quadratic_cost], dtype=float),
+        gross_interest_rate=np.asarray([
+            calculator.config.gross_interest_rate
+        ], dtype=float),
+        ftp_rate=np.asarray([calculator.config.ftp_rate], dtype=float),
+        linear_cost_mode=np.asarray([calculator.config.linear_cost_mode]),
+        interest_rates=np.asarray([
+            json.dumps(calculator.config.interest_rates, sort_keys=True)
+        ]),
         risk_tolerance=np.asarray([calculator.config.risk_tolerance], dtype=float),
         group_mean_min_ratio=np.asarray([json.dumps(calculator.config.group_mean_min_ratio, sort_keys=True)]),
+        tier_min_limits=np.asarray([json.dumps(calculator.config.min_limit, sort_keys=True)]),
+        customer_min_limit_enabled=np.asarray([calculator.config.customer_min_limit_enabled]),
+        customer_min_limit_decrease=np.asarray([
+            calculator.config.customer_min_limit_decrease
+        ], dtype=float),
         optimization_scope=np.asarray([calculator.config.optimization_scope]),
         solver_backend=np.asarray([calculator.config.solver_backend]),
         optimizer_max_variables=np.asarray([calculator.config.milp_max_variables]),

@@ -96,13 +96,13 @@ probability_grid_large_crossfit_calibrated/
 对客户 `i` 和候选额度 `L`，优化目标为：
 
 ```text
-pi_i(L) = r_i × L × p_usage_i(L)
-          − LGD_i × L × p_default_i(L)
+pi_i(L) = r_i × L × u_i
+          − LGD_i × L × p_default_i(L) × u_i
           − c1 × L
           − c2 × L²
 ```
 
-人才等级不直接乘入收益，而是通过分档额度上下限和组均额度约束进入优化。
+其中 `u_i` 是客户历史支用率，频繁支用概率网格不进入当前目标函数。人才等级不直接乘入收益，而是通过分档额度上下限和组均额度约束进入优化。
 
 ## 参数设置
 
@@ -201,10 +201,16 @@ reports/parameter_selection/c2_selection/c2_sensitivity_summary.csv
 | 4 | E |
 | 5 | D |
 
-所有等级最低额度均为 0。最高额度只使用开发拟合集历史额度计算：
+F3/F2/F1、E、D 的等级最低额度分别为 1,000、20,000、100,000 元。客户最终硬下限为：
+
+```text
+max(所属等级最低额度, 原额度 − CUSTOMER_MIN_LIMIT_DECREASE)
+```
+
+当前 `CUSTOMER_MIN_LIMIT_DECREASE=10,000` 元。即 F3/F2/F1 为 `max(1,000, 原额度−降幅)`，E 为 `max(20,000, 原额度−降幅)`，D 为 `max(100,000, 原额度−降幅)`。最高额度只使用开发拟合集历史额度计算：
 
 1. 计算全体客户历史额度 P99，记为 `U0`；
-2. F3/F2/F1 档按 `w=n/(n+500)` 对该档历史最大额度和 `U0` 做样本量收缩；
+2. F3/F2/F1 档按 `w=n/(n+TIER_SHRINK_K)` 对该档历史最大额度和 `U0` 做样本量收缩；
 3. 强制 F3、F2、F1 上限非递减；
 4. E 档上限取 `max(F1上限, 1.1×U0)`；
 5. D 档上限取 `max(E上限, 1.2×U0)`；
@@ -212,7 +218,7 @@ reports/parameter_selection/c2_selection/c2_sensitivity_summary.csv
 
 技术文档要求的是 `F3 ≤ F2 ≤ F1 ≤ E ≤ D`，即非递减而非严格递增，因此在历史上限、总体 P99 或 `GRID_MAX` 截顶作用下，相邻等级允许出现相同上限。代码不会额外增加技术文档之外的百分比 gap。
 
-如果数据中出现未定义的 A/B/C 等级，参数计算会直接报错并终止整个流程。代码不会删除 A/B/C 客户后继续优化其余等级，也不会让 A/B/C 在缺少专门额度上限和组均约束的情况下进入优化。必须先补充并确认 A/B/C 的政策规则，才能将这三类客户纳入正式优化。
+如果数据中出现 A/B/C 等级，其等级最低额度暂为 0，因此客户硬下限继续使用 `max(0, 原额度−CUSTOMER_MIN_LIMIT_DECREASE)`；等级上限默认使用 `GRID_MAX`。
 
 ### 组均额度约束
 
@@ -368,7 +374,14 @@ reports/test_offline_evaluation/
 reports/full_crossfit_optimization/
 ```
 
-正式优化目录主要包含客户级结果、组合摘要、额度调整分布、人才等级摘要、概率变化、边界命中、集中度、求解器状态、复用状态和图表。
+正式优化目录主要包含客户级结果、组合摘要、额度调整分布、人才等级摘要、概率变化、边界命中、集中度、求解器状态、复用状态和图表。可视化目录新增：
+
+- `profit_comparison.png`：总体及分人才等级的优化前后模型估计风险调整利润对比；
+- `profit_comparison.csv`：相同口径的客户数、优化前利润、优化后利润、变化额和变化率。
+
+利润图直接汇总优化器输出的 `original_objective_value` 和 `optimized_objective_value`，使用当次求解实际生效的利率、历史支用率、LGD、违约概率、`c1` 与 `c2`，不使用可视化默认参数重新计算。
+
+`minimum_limit_policy_by_tier.csv` 会按人才等级保存本次实际生效的等级最低额、`CUSTOMER_MIN_LIMIT_DECREASE` 以及解析后的客户硬下限范围，便于检查 Notebook 内核是否仍残留旧 override。
 
 ## 结果解释边界
 

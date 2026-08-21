@@ -6,9 +6,10 @@ viz_credit_limit.py - Credit Limit Optimization Visualization
 Fig 1: Boxplot - original vs optimized credit limit by talent tier
 Fig 2: Bar chart - avg default probability by limit bucket x tier
 Fig 3: Bar chart - avg usage probability by limit bucket x tier
-Fig 4: Bar chart - unit profit before vs after optimization by tier
+Fig 4: Bar chart - unit objective before vs after optimization by tier
 Fig 5: Summary table - tier stats (true rates + predicted probabilities)
 Fig 6: Distribution comparison chart - original vs optimized limits
+Fig 7: Total and tier model-estimated profit before vs after optimization
 """
 
 import os
@@ -34,10 +35,6 @@ RESULTS_CSV = globals().get("RESULTS_CSV_OVERRIDE", "reports/credit_limit_large_
 TALENT_NPY = globals().get("TALENT_NPY_OVERRIDE", "reports/talent_levels.npy")
 PROB_GRID_DIR = globals().get("PROB_GRID_DIR_OVERRIDE", "probability_grid_large")
 OUT_DIR = globals().get("VIZ_OUT_DIR_OVERRIDE", "reports/viz")
-INTEREST_RATE = float(globals().get("INTEREST_RATE_OVERRIDE", 0.03))
-LGD_COEFFICIENT = float(globals().get("LGD_COEFFICIENT_OVERRIDE", 0.45))
-LINEAR_COST = float(globals().get("LINEAR_COST_OVERRIDE", 0.005))
-QUADRATIC_COST = float(globals().get("QUADRATIC_COST_OVERRIDE", 1e-9))
 DPI = int(globals().get("DPI_OVERRIDE", 150))
 
 # 校准概率网格目录: 若 notebook 传入则用校准网格做概率查表，否则与 PROB_GRID_DIR 相同
@@ -114,6 +111,49 @@ _usage_cal_col = "optimized_usage_prob_calibrated" if "optimized_usage_prob_cali
 _default_cal_col = "optimized_default_prob_calibrated" if "optimized_default_prob_calibrated" in df_results.columns else "predicted_default_prob"
 p_u_o = df_results[_usage_cal_col].values.astype(float)
 p_d_o = df_results[_default_cal_col].values.astype(float)
+
+_objective_required = [
+    "original_objective_value",
+    "optimized_objective_value",
+    "objective_interest_rate",
+    "lgd_coefficient",
+    "linear_cost",
+    "quadratic_cost",
+    "utilization_used",
+]
+_objective_missing = [c for c in _objective_required if c not in df_results.columns]
+if _objective_missing:
+    raise ValueError(
+        "优化结果缺少实际目标函数字段 %s；请关闭 REUSE_OPTIMIZATION 后重新运行优化。"
+        % _objective_missing
+    )
+_objective_columns = {}
+for _column in _objective_required:
+    _values = pd.to_numeric(df_results[_column], errors="coerce").to_numpy(dtype=float)
+    if not np.isfinite(_values).all():
+        raise ValueError("优化结果字段 %s 存在空值或非有限值" % _column)
+    _objective_columns[_column] = _values
+
+objective_base = _objective_columns["original_objective_value"]
+objective_opt = _objective_columns["optimized_objective_value"]
+objective_rate = _objective_columns["objective_interest_rate"]
+objective_lgd = _objective_columns["lgd_coefficient"]
+objective_linear_cost = _objective_columns["linear_cost"]
+objective_quadratic_cost = _objective_columns["quadratic_cost"]
+historical_utilization = _objective_columns["utilization_used"]
+
+if "objective_change" in df_results.columns:
+    _saved_change = pd.to_numeric(
+        df_results["objective_change"], errors="coerce"
+    ).to_numpy(dtype=float)
+    if not np.allclose(
+        _saved_change,
+        objective_opt - objective_base,
+        rtol=1e-9,
+        atol=1e-6,
+        equal_nan=False,
+    ):
+        raise ValueError("objective_change 与优化前后目标函数值不一致")
 
 _observed_limit_max = float(np.nanmax([np.nanmax(orig_L), np.nanmax(opt_L)]))
 _bin_upper = max(1_500_000.0, np.ceil(_observed_limit_max / 500_000.0) * 500_000.0)
@@ -584,28 +624,18 @@ print("  Saved: usage_prob_bar.png")
 # ============================================================
 print("[Fig 4] Unit risk-adjusted objective before vs after optimization by tier...")
 
-if "utilization_used" not in df_results.columns:
-    raise ValueError("优化结果缺少 utilization_used，无法按当前目标函数计算 Fig 4/5")
-historical_utilization = pd.to_numeric(
-    df_results["utilization_used"], errors="coerce"
-).to_numpy(dtype=float)
-if not np.isfinite(historical_utilization).all():
-    raise ValueError("utilization_used 存在空值或非有限值")
-
-unit_base = (
-    INTEREST_RATE * historical_utilization
-    - LGD_COEFFICIENT * p_d_base * historical_utilization
-    - LINEAR_COST
-    - QUADRATIC_COST * orig_L
+unit_base = np.divide(
+    objective_base,
+    orig_L,
+    out=np.zeros_like(objective_base),
+    where=orig_L > 0,
 )
-unit_opt = (
-    INTEREST_RATE * historical_utilization
-    - LGD_COEFFICIENT * p_d_o * historical_utilization
-    - LINEAR_COST
-    - QUADRATIC_COST * opt_L
+unit_opt = np.divide(
+    objective_opt,
+    opt_L,
+    out=np.zeros_like(objective_opt),
+    where=opt_L > 0,
 )
-unit_base = np.where(orig_L > 0, unit_base, 0.0)
-unit_opt = np.where(opt_L > 0, unit_opt, 0.0)
 
 df_up = pd.DataFrame({"tier": tier_labels, "base": unit_base, "opt": unit_opt})
 grp = df_up.groupby("tier")[["base", "opt"]].mean()
@@ -671,13 +701,21 @@ for tier in TIER_ORDER:
         "Pred Freq Cal (opt)": "%.2f%%" % (p_u_o[mask].mean() * 100),
         "Pred Default Cal (opt)": "%.2f%%" % (p_d_o[mask].mean() * 100),
     }
-    _avg_u = float(historical_utilization[mask].mean())
-    _avg_pd_cal = float(p_d_o[mask].mean())
-    _avg_opt_l = float(opt_L[mask].mean())
-    _income_term = INTEREST_RATE * _avg_u
-    _risk_term = LGD_COEFFICIENT * _avg_u * _avg_pd_cal
-    _c1_term = LINEAR_COST
-    _c2_term = QUADRATIC_COST * _avg_opt_l
+    _active = opt_L > 0
+    _income_component = np.where(
+        _active, objective_rate * historical_utilization, 0.0
+    )
+    _risk_component = np.where(
+        _active, objective_lgd * historical_utilization * p_d_o, 0.0
+    )
+    _c1_component = np.where(_active, objective_linear_cost, 0.0)
+    _c2_component = np.where(
+        _active, objective_quadratic_cost * opt_L, 0.0
+    )
+    _income_term = float(_income_component[mask].mean())
+    _risk_term = float(_risk_component[mask].mean())
+    _c1_term = float(_c1_component[mask].mean())
+    _c2_term = float(_c2_component[mask].mean())
     row.update({
         "Revenue r*AvgU": round(_income_term, 6),
         "Risk lambda*AvgU*AvgPD": round(_risk_term, 6),
@@ -849,6 +887,124 @@ plt.close(fig6)
 print("  Saved: limit_distribution.png  (CSV: limit_distribution.csv)")
 
 
+# ============================================================
+# Fig 7: Model-estimated profit before vs after optimization
+# ============================================================
+print("[Fig 7] Model-estimated profit before vs after optimization...")
+
+df_profit = pd.DataFrame({
+    "tier": tier_labels,
+    "profit_before": objective_base,
+    "profit_after": objective_opt,
+})
+profit_by_tier = df_profit.groupby("tier", as_index=False).agg(
+    customer_count=("tier", "size"),
+    profit_before=("profit_before", "sum"),
+    profit_after=("profit_after", "sum"),
+)
+profit_by_tier["_order"] = profit_by_tier["tier"].map(
+    {tier: order for order, tier in enumerate(ALL_TIER_ORDER)}
+)
+profit_by_tier = profit_by_tier.sort_values("_order").drop(columns="_order")
+profit_by_tier["scope"] = profit_by_tier["tier"]
+
+profit_overall = pd.DataFrame([{
+    "scope": "Overall",
+    "tier": "Overall",
+    "customer_count": int(len(df_profit)),
+    "profit_before": float(objective_base.sum()),
+    "profit_after": float(objective_opt.sum()),
+}])
+profit_comparison = pd.concat(
+    [profit_overall, profit_by_tier], ignore_index=True, sort=False
+)
+profit_comparison["profit_change"] = (
+    profit_comparison["profit_after"] - profit_comparison["profit_before"]
+)
+_profit_change_values = profit_comparison["profit_change"].to_numpy(dtype=float)
+_profit_before_values = profit_comparison["profit_before"].to_numpy(dtype=float)
+profit_comparison["profit_change_rate"] = np.divide(
+    _profit_change_values,
+    _profit_before_values,
+    out=np.full(len(profit_comparison), np.nan, dtype=float),
+    where=np.abs(_profit_before_values) > 1e-12,
+)
+profit_comparison.to_csv(
+    os.path.join(OUT_DIR, "profit_comparison.csv"),
+    index=False,
+    encoding="utf-8-sig",
+)
+print(profit_comparison.to_string(index=False))
+
+fig7, axes7 = plt.subplots(1, 2, figsize=(15, 5.8), dpi=DPI)
+_profit_colors = ["#9ecae1", "#2171b5"]
+_overall_values = profit_overall[["profit_before", "profit_after"]].iloc[0].to_numpy(dtype=float)
+_overall_bars = axes7[0].bar(
+    ["Before", "After"], _overall_values, color=_profit_colors, edgecolor="white"
+)
+for _bar, _value in zip(_overall_bars, _overall_values):
+    axes7[0].annotate(
+        "%+.2fM" % (_value / 1_000_000.0),
+        xy=(_bar.get_x() + _bar.get_width() / 2.0, _value),
+        xytext=(0, 5 if _value >= 0 else -14),
+        textcoords="offset points",
+        ha="center",
+        va="bottom" if _value >= 0 else "top",
+        fontsize=9,
+    )
+_overall_change = float(profit_comparison.iloc[0]["profit_change"])
+_overall_rate = float(profit_comparison.iloc[0]["profit_change_rate"])
+_rate_text = "N/A" if not np.isfinite(_overall_rate) else "%+.2f%%" % (_overall_rate * 100.0)
+axes7[0].set_title(
+    "Overall\nChange: %+.2fM (%s)" % (_overall_change / 1_000_000.0, _rate_text)
+)
+axes7[0].set_ylabel("Model-estimated Risk-adjusted Profit (CNY million)")
+axes7[0].yaxis.set_major_formatter(
+    mticker.FuncFormatter(lambda value, _: "%.1f" % (value / 1_000_000.0))
+)
+axes7[0].axhline(0, color="#666666", linewidth=0.8)
+axes7[0].grid(axis="y", linestyle="--", alpha=0.35)
+
+_tier_x = np.arange(len(profit_by_tier))
+_tier_width = 0.38
+axes7[1].bar(
+    _tier_x - _tier_width / 2.0,
+    profit_by_tier["profit_before"],
+    width=_tier_width,
+    color=_profit_colors[0],
+    edgecolor="white",
+    label="Before",
+)
+axes7[1].bar(
+    _tier_x + _tier_width / 2.0,
+    profit_by_tier["profit_after"],
+    width=_tier_width,
+    color=_profit_colors[1],
+    edgecolor="white",
+    label="After",
+)
+axes7[1].set_xticks(_tier_x)
+axes7[1].set_xticklabels(profit_by_tier["tier"].astype(str).tolist())
+axes7[1].set_title("By Talent Tier")
+axes7[1].set_ylabel("Model-estimated Risk-adjusted Profit (CNY million)")
+axes7[1].yaxis.set_major_formatter(
+    mticker.FuncFormatter(lambda value, _: "%.1f" % (value / 1_000_000.0))
+)
+axes7[1].axhline(0, color="#666666", linewidth=0.8)
+axes7[1].grid(axis="y", linestyle="--", alpha=0.35)
+axes7[1].legend()
+
+fig7.suptitle(
+    "Model-estimated Risk-adjusted Profit: Before vs After Optimization",
+    fontsize=14,
+)
+plt.tight_layout(rect=[0, 0, 1, 0.95])
+_savefig(fig7, "profit_comparison.png")
+plt.close(fig7)
+print("  Saved: profit_comparison.png  (CSV: profit_comparison.csv)")
+
+
 print("\nAll figures saved to %s/" % OUT_DIR)
 print("  Note: predicted usage/default probabilities come from %s (calibration_method=%s)." % (_grid_dir_used, _cal_method))
 print("  Note: true usage/default rates are actual positive-label fractions in the training set.")
+print("  Note: profit comparison uses objective values saved by the optimizer with runtime parameters.")

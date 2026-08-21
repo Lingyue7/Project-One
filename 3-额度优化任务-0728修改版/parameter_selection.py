@@ -16,8 +16,24 @@ TIER_TO_LEVEL = {
     "F1": 3, "F1级": 3, "f1": 3,
     "E": 4, "E级": 4, "e": 4,
     "D": 5, "D级": 5, "d": 5,
+    "C": 6, "C级": 6, "c": 6,
+    "B": 7, "B级": 7, "b": 7,
+    "A": 8, "A级": 8, "a": 8,
 }
-LEVEL_TO_TIER = {1: "F3", 2: "F2", 3: "F1", 4: "E", 5: "D"}
+LEVEL_TO_TIER = {
+    1: "F3", 2: "F2", 3: "F1", 4: "E",
+    5: "D", 6: "C", 7: "B", 8: "A",
+}
+DEFAULT_TIER_MIN_LIMITS = {
+    1: 1_000.0,
+    2: 1_000.0,
+    3: 1_000.0,
+    4: 20_000.0,
+    5: 100_000.0,
+    6: 0.0,
+    7: 0.0,
+    8: 0.0,
+}
 
 
 class ParameterSelectionResult(object):
@@ -92,7 +108,7 @@ def _normalize_talent_levels(series: pd.Series) -> pd.Series:
     result = result.astype(int)
     unsupported = sorted(set(result.unique()) - set(LEVEL_TO_TIER))
     if unsupported:
-        raise ValueError("技术方案仅定义 F3/F2/F1/E/D 五档，发现未定义等级: %s" % unsupported)
+        raise ValueError("无法识别的人才数字等级: %s" % unsupported)
     return result
 
 
@@ -316,7 +332,7 @@ def derive_tier_limit_policy(
     grid_step: float = 500.0,
     grid_max: Optional[float] = None,
 ):
-    """按技术文档的总体P99、历史上限收缩与E/D放缩计算F3~D上限。"""
+    """计算F3~D等级下限，以及总体P99、历史收缩和E/D放缩上限。"""
     if talent_col not in customer_df or credit_limit_col not in customer_df:
         raise ValueError("等级上限估计缺少字段: %s" % [talent_col, credit_limit_col])
     work = customer_df[[talent_col, credit_limit_col]].copy()
@@ -381,7 +397,8 @@ def derive_tier_limit_policy(
 
     summary = pd.DataFrame(rows)
     summary["rounded_upper_limit"] = summary["talent_level"].map(rounded)
-    min_limits = {level: 0.0 for level in range(1, 6)}
+    min_limits = dict(DEFAULT_TIER_MIN_LIMITS)
+    summary["tier_minimum_limit"] = summary["talent_level"].map(min_limits)
     return min_limits, rounded, summary
 
 

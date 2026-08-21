@@ -14,6 +14,30 @@ from optimization_sampling import build_optimization_sample_plan
 
 
 class CreditLimitPipelineTests(unittest.TestCase):
+    def test_customer_minimum_limits_combine_tier_floor_and_maximum_decrease(self):
+        config = LargePrecomputedGridConfig()
+        config.customer_min_limit_enabled = True
+        config.customer_min_limit_decrease = 50_000.0
+        config.min_limit.update({
+            1: 1_000.0,
+            2: 1_000.0,
+            3: 1_000.0,
+            4: 20_000.0,
+            5: 100_000.0,
+            8: 0.0,
+        })
+        calculator = LargePrecomputedGridCalculator(config)
+
+        actual = calculator._resolve_customer_minimum_limits(
+            np.asarray([10_000.0, 80_000.0, 51_000.0, 60_000.0, 120_000.0, 80_000.0]),
+            np.asarray([1, 2, 3, 4, 5, 8]),
+        )
+
+        np.testing.assert_array_equal(
+            actual,
+            np.asarray([1_000.0, 30_000.0, 1_000.0, 20_000.0, 100_000.0, 30_000.0]),
+        )
+
     def test_probability_grid_sample_plan_is_deterministic_and_scoped(self):
         work = pd.DataFrame({
             "cst_id": [f"c{i}" for i in range(30)],
@@ -41,28 +65,65 @@ class CreditLimitPipelineTests(unittest.TestCase):
     def test_tier_caps_follow_technical_document_without_extra_gap(self):
         work = pd.DataFrame({
             "档位": np.repeat(["F3", "F2", "F1", "E", "D"], 20),
-            "credamt": np.repeat(100.0, 100),
+            "credamt": np.repeat(100_000.0, 100),
         })
 
         min_limits, uncapped, _ = derive_tier_limit_policy(
             work,
             talent_col="档位",
             credit_limit_col="credamt",
-            grid_step=10.0,
+            grid_step=10_000.0,
             grid_max=None,
         )
         _, capped, _ = derive_tier_limit_policy(
             work,
             talent_col="档位",
             credit_limit_col="credamt",
-            grid_step=10.0,
-            grid_max=100.0,
+            grid_step=10_000.0,
+            grid_max=100_000.0,
         )
 
-        self.assertEqual(min_limits, {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0, 5: 0.0})
-        self.assertEqual(uncapped, {1: 100.0, 2: 100.0, 3: 100.0, 4: 110.0, 5: 120.0})
-        self.assertEqual(capped, {1: 100.0, 2: 100.0, 3: 100.0, 4: 100.0, 5: 100.0})
+        self.assertEqual(min_limits, {
+            1: 1_000.0,
+            2: 1_000.0,
+            3: 1_000.0,
+            4: 20_000.0,
+            5: 100_000.0,
+            6: 0.0,
+            7: 0.0,
+            8: 0.0,
+        })
+        self.assertEqual(uncapped, {
+            1: 100_000.0, 2: 100_000.0, 3: 100_000.0,
+            4: 110_000.0, 5: 120_000.0,
+        })
+        self.assertEqual(capped, {
+            1: 100_000.0, 2: 100_000.0, 3: 100_000.0,
+            4: 100_000.0, 5: 100_000.0,
+        })
         self.assertTrue(all(capped[level] <= capped[level + 1] for level in range(1, 5)))
+
+    def test_tier_policy_accepts_a_b_c_while_retaining_f3_to_d_floors(self):
+        work = pd.DataFrame({
+            "档位": ["F3", "F2", "F1", "E", "D", "C", "B", "A"],
+            "credamt": np.repeat(100_000.0, 8),
+        })
+
+        min_limits, max_limits, _ = derive_tier_limit_policy(
+            work,
+            talent_col="档位",
+            credit_limit_col="credamt",
+            grid_step=500.0,
+            grid_max=1_000_000.0,
+        )
+
+        self.assertEqual(min_limits[1], 1_000.0)
+        self.assertEqual(min_limits[4], 20_000.0)
+        self.assertEqual(min_limits[5], 100_000.0)
+        self.assertEqual(min_limits[6], 0.0)
+        self.assertEqual(min_limits[7], 0.0)
+        self.assertEqual(min_limits[8], 0.0)
+        self.assertEqual(sorted(max_limits), [1, 2, 3, 4, 5])
 
     def test_scope_and_tier_stratified_sample_keep_all_inputs_aligned(self):
         n_rows = 10
