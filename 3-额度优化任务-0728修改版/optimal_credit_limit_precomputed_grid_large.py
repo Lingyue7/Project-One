@@ -30,13 +30,13 @@ import numpy as np
 import pandas as pd
 
 OPTIMIZER_STATE_VERSION = "runtime_minimum_limit_policy_v15"
-DEFAULT_CUSTOMER_MIN_LIMIT_DECREASE = 10_000.0
+DEFAULT_CUSTOMER_MIN_LIMIT_DECREASE = 50_000.0
 DEFAULT_TIER_MIN_LIMITS = {
-    1: 1_000.0,
-    2: 1_000.0,
-    3: 1_000.0,
-    4: 20_000.0,
-    5: 100_000.0,
+    1: 0.0,
+    2: 0.0,
+    3: 0.0,
+    4: 0.0,
+    5: 0.0,
     6: 0.0,
     7: 0.0,
     8: 0.0,
@@ -1217,7 +1217,7 @@ class LargePrecomputedGridCalculator(OptimalCreditLimitCalculator):
         return float((p_default * L).sum())
 
     def _resolve_customer_minimum_limits(self, base_limits, talent_levels):
-        """合并等级下限与客户原额度最大允许降幅，返回逐客户硬下限。"""
+        """返回逐客户硬下限：max(0, 原始授信额度 - 最大允许降幅)。"""
         base_limits = np.asarray(base_limits, dtype=float).reshape(-1)
         levels = np.asarray(talent_levels, dtype=int).reshape(-1)
         if len(base_limits) != len(levels):
